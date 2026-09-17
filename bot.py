@@ -1,5359 +1,5736 @@
 """
-Discord Auto Middleman Bot (LTC)
-Production-ready, single-file implementation using discord.py 2.x
-Supports: MongoDB persistence, Aprione LTC API, persistent views, full AutoMM flow
+Discord AutoBuy Bot — LTC Payments
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Products organised by CATEGORY
+• Restock via .txt file attachment (one item per line)
+• MongoDB storage — Railway-ready
+• All config via environment variables
 """
 
-from __future__ import annotations
-
-import asyncio
-import io
-import logging
 import os
-import re as _re
-import traceback
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
+import re
+import asyncio
+import random
+import string
+from datetime import datetime
 
-import html as html_lib
-
-import aiohttp
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
+import aiohttp
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+load_dotenv()  # local dev only — Railway injects env vars automatically
 
-# ---------------------------------------------------------------------------
-# Config loader — config.py values take priority over secrets/env vars
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG  (set these as env vars — locally use a .env file)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-try:
-    import config as _cfg_file  # type: ignore
-except ImportError:
-    _cfg_file = None
+DISCORD_TOKEN       = os.environ["DISCORD_TOKEN"]
+MONGO_URI           = os.environ["MONGO_URI"]
+ADMIN_ROLE_ID        = int(os.environ.get("ADMIN_ROLE_ID", "0"))
+LTC_WALLET_ADDRESS   = os.environ.get("LTC_WALLET_ADDRESS", "") or os.environ.get("LTC_WALLET_ADDREDD", "")  # ADDREDD is the typo'd secret name
+APIRONE_ACCOUNT    = os.environ.get("APIRONE_ACCOUNT", "")      # e.g. apr-f9e1211f4b52a50bcf3c36819fdc4ad3
+LTC_DEV_MODE         = os.environ.get("LTC_DEV_MODE", "false").lower() == "true"
+PAYMENT_TIMEOUT_MIN  = int(os.environ.get("PAYMENT_TIMEOUT_MINUTES", "30"))
+DB_NAME              = os.environ.get("DB_NAME", "autobuy")
+FEE_TOLERANCE_LTC    = float(os.environ.get("LTC_FEE_TOLERANCE", "0.0005"))
 
+ORDER_CATEGORY_ID    = int(os.environ.get("ORDER_CATEGORY_ID", "0"))
+APIRONE_TRANSFER_KEY = os.environ.get("APIRONE_TRANSFER_KEY", "")  # from account creation response
+# Channel IDs for logging
+LOG_CHANNEL_ID      = int(os.environ.get("LOG_CHANNEL_ID", "0"))       # all bot events
+# Panel customisation — managed via &shopname / &shopbanner / &shopicon commands
+# These are stored in MongoDB (col_settings) so they persist and update live.
+# No env vars needed for these.
 
-def _cfg(key: str, default: Optional[str] = None) -> Optional[str]:
-    if _cfg_file is not None:
-        val = getattr(_cfg_file, key, None)
-        if val:                        # non-empty string in config.py wins
-            return str(val)
-    return os.environ.get(key, default) or default
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATABASE — MongoDB via Motor (async)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  COLLECTIONS
+#  ───────────
+#  categories  →  { slug, name, description, instruction, price_usd, stock: [] }
+#  orders      →  { orderId, userId, categorySlug, categoryName, quantity,
+#                   totalUSD, ltcAmount, ltcAddress, txId, status, ... }
+#
+#  slug = stable lowercase-hyphenated key derived from the name
+#  e.g. "Netflix 1 Month"  →  "netflix-1-month"
+#
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-def _cfg_required(key: str) -> str:
-    val = _cfg(key)
-    if not val:
-        raise RuntimeError(f"Missing required setting: {key}")
-    return val
-
-
-# ---------------------------------------------------------------------------
-# Environment / secrets
-# ---------------------------------------------------------------------------
-
-DISCORD_TOKEN: str        = _cfg_required("DISCORD_TOKEN")
-MONGODB_URI: str          = _cfg_required("MONGODB_URI")
-APRIONE_ACCOUNT: str      = _cfg_required("APRIONE_ACCOUNT")
-APRIONE_TRANSFER_KEY: str = _cfg_required("APRIONE_TRANSFER_KEY")
-LOG_LEVEL: str            = (_cfg("LOG_LEVEL") or "INFO").upper()
-
-ADMIN_ROLE_ID: Optional[int] = int(_cfg("ADMIN_ROLE_ID")) if _cfg("ADMIN_ROLE_ID") else None
-USER_ROLE_ID:  Optional[int] = int(_cfg("USER_ROLE_ID"))  if _cfg("USER_ROLE_ID")  else None
-LOG_CHANNEL_ID: Optional[int] = int(_cfg("LOG_CHANNEL_ID")) if _cfg("LOG_CHANNEL_ID") else None
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("automm")
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-APRIONE_BASE = "https://apirone.com/api/v2"
-REQUIRED_CONFIRMATIONS = 2
-POLL_INTERVAL = 30          # seconds between payment polls
-MAX_RETRIES = 5
-RETRY_BACKOFF_BASE = 2
+mongo        = AsyncIOMotorClient(MONGO_URI)
+db           = mongo[DB_NAME]
+col_cats     = db["categories"]
+col_orders   = db["orders"]
+col_settings = db["settings"]   # { key, value } — shop name/banner/icon
+col_toc      = db["toc"]         # { slug, message } — per-category terms of conditions
+col_blacklist    = db["blacklist"]    # { userId, reason, addedAt }
+col_reservations = db["reservations"] # { slug, orderId, qty, expiresAt } — prevent race condition
+col_groups       = db["groups"]       # { slug, name, createdAt } — product groups/categories folders
 
 
-# ---------------------------------------------------------------------------
-# Transaction stage labels
-# ---------------------------------------------------------------------------
+# ── Settings helpers (shop name, banner, icon stored in DB) ───────────────────
 
-class Stage:
-    ROLE_SELECT    = "role_select"
-    TOS            = "tos"
-    AMOUNT         = "amount"
-    DEPOSIT        = "deposit"
-    AWAITING_FUNDS = "awaiting_funds"
-    DELIVERY       = "delivery"
-    RELEASE        = "release"
-    WITHDRAWAL     = "withdrawal"
-    FEEDBACK       = "feedback"
-    COMPLETED      = "completed"
-    CANCELLED      = "cancelled"
-    DISPUTED       = "disputed"
+SETTING_DEFAULTS = {
+    "shop_name":  "AutoBuy Store",
+    "banner_url": "",
+    "icon_url":   "https://cryptologos.cc/logos/litecoin-ltc-logo.png",
+}
 
-    ACTIVE_STAGES = (
-        ROLE_SELECT, TOS, AMOUNT, DEPOSIT, AWAITING_FUNDS,
-        DELIVERY, RELEASE, WITHDRAWAL, FEEDBACK,
+# ── Quantity picker / purchase summary helpers ────────────────────────────────
+
+INFO_IMAGE_URL      = "https://i.ibb.co/C3n6RWX5/1000272252-removebg-preview.png"
+LOADING_IMAGE_URL   = "https://i.ibb.co/N6bzmCB1/k-Onzy.gif"
+CONFIRMED_IMAGE_URL = "https://i.ibb.co/1tZPjgjs/1000272248-removebg-preview.png"
+
+
+async def send_payment_detected_card(channel, user, ltc_amount, addr_url: str = ""):
+    """Components V2 'Payment Detected' card — matches the yellow processing style."""
+    if not channel:
+        return
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=discord.Colour(0xFAA61A))
+    container.add_item(discord.ui.Section(
+        discord.ui.TextDisplay("## Payment Detected"),
+        discord.ui.TextDisplay("**Status:** `Processing`"),
+        accessory=discord.ui.Thumbnail(media=LOADING_IMAGE_URL),
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        f"{user.mention if user else 'Buyer'} — we have detected your payment. "
+        "Please wait for **1 confirmation** on the blockchain.\n\n"
+        f"**Amount:** `{ltc_amount} LTC`\n"
+        "Your items will be delivered automatically once confirmed."
+    ))
+    if addr_url:
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link, label="View on Blockchain", url=addr_url, emoji="🔗"
+        ))
+        container.add_item(row)
+    view.add_item(container)
+    try:
+        await channel.send(view=view)
+    except Exception as e:
+        print(f"[card] Failed to send Payment Detected card: {e}")
+
+
+def get_bot_emoji(guild: "discord.Guild | None", name: str, fallback: str) -> str:
+    """Return the custom `:name:` emoji uploaded via &setupemojis if it exists on the
+    guild, otherwise fall back to a plain unicode emoji."""
+    if guild:
+        emoji = discord.utils.get(guild.emojis, name=name)
+        if emoji:
+            return str(emoji)
+    return fallback
+
+
+async def send_payment_confirmed_card(channel, user, addr_url: str = ""):
+    """Components V2 'Payment Confirmed' card — matches the green confirmed style."""
+    if not channel:
+        return
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=discord.Colour(0x57F287))
+    container.add_item(discord.ui.Section(
+        discord.ui.TextDisplay("## Payment Confirmed"),
+        discord.ui.TextDisplay("**Status:** `Confirmed`"),
+        accessory=discord.ui.Thumbnail(media=CONFIRMED_IMAGE_URL),
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        f"{user.mention if user else 'Buyer'} — transaction verified. Processing your items..."
+    ))
+    if addr_url:
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link, label="View on Blockchain", url=addr_url, emoji="🔗"
+        ))
+        container.add_item(row)
+    view.add_item(container)
+    try:
+        await channel.send(view=view)
+    except Exception as e:
+        print(f"[card] Failed to send Payment Confirmed card: {e}")
+
+
+def _build_qty_picker_embed(cat: dict, qty: int) -> discord.Embed:
+    """Build the Select Quantity embed (Image 1 style)."""
+    is_infinite = bool(cat.get("infinite_stock"))
+    stock_count = len(cat.get("stock", [])) if not is_infinite else 9999
+    stock_str   = "♾️ Unlimited" if is_infinite else str(stock_count)
+    total_usd   = round(cat["price_usd"] * qty, 2)
+    stats = (
+        f"Available Stock: {stock_str}\n"
+        f"Selected Qty: {qty}\n"
+        f"Total Price: ${total_usd}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Embed colour palette
-# ---------------------------------------------------------------------------
-
-COLOR_PRIMARY = 0x9B59B6
-COLOR_SUCCESS = 0x9B59B6
-COLOR_WARNING = 0x9B59B6
-COLOR_DANGER  = 0x9B59B6
-COLOR_INFO    = 0x9B59B6
-
-
-# Thumbnail / icon URLs used in payment embeds
-SPINNER_GIF    = "https://i.ibb.co/N6bzmCB1/k-Onzy.gif"
-CHECKMARK_IMG  = "https://i.ibb.co/235dBzmj/green-check-mark-with-round-outline-free-png.png"
-BADGE_IMG      = "https://i.ibb.co/bMmz2dZ9/1000271835-removebg-preview.png"
-LTC_LOGO       = "https://s2.coinmarketcap.com/static/img/coins/64x64/2.png"
-
-
-def make_embed(
-    title: str,
-    description: str = "",
-    color: int = COLOR_PRIMARY,
-    fields: Optional[list[tuple[str, str, bool]]] = None,
-    footer: Optional[str] = None,
-    footer_icon_url: Optional[str] = None,
-    timestamp: bool = True,
-    thumbnail_url: Optional[str] = None,
-) -> discord.Embed:
-    embed = discord.Embed(title=title, description=description, color=color)
-    if timestamp:
-        embed.timestamp = datetime.now(timezone.utc)
-    for name, value, inline in (fields or []):
-        embed.add_field(name=name, value=str(value), inline=inline)
-    if footer:
-        embed.set_footer(text=footer, icon_url=footer_icon_url or discord.utils.MISSING)
-    if thumbnail_url:
-        embed.set_thumbnail(url=thumbnail_url)
+    embed = discord.Embed(
+        title="📌  Select Quantity",
+        description=(
+            "**ℹ️  Order Summary**\n"
+            "• Item:\n"
+            f"```\n{cat['name']}\n```\n"
+            f"```\n{stats}\n```"
+        ),
+        color=0x5865F2,
+    )
+    embed.set_thumbnail(url=INFO_IMAGE_URL)
+    embed.set_footer(
+        text="📌 Tip: Click the ✏️ Pencil icon above to type an exact quantity easily without using the + / − buttons."
+    )
     return embed
 
 
-# ---------------------------------------------------------------------------
-# Database (MongoDB via motor)
-# ---------------------------------------------------------------------------
-
-class Database:
-    """Async MongoDB wrapper."""
-
-    def __init__(self, uri: str) -> None:
-        self.client = AsyncIOMotorClient(uri)
-        db = self.client["automm"]
-        self.transactions = db["transactions"]
-        self.users        = db["users"]
-        self.feedback     = db["feedback"]
-        self.settings     = db["settings"]
-        self.blacklist    = db["blacklist"]
-        self.logs         = db["logs"]
-
-    async def setup_indexes(self) -> None:
-        await self.transactions.create_index("transaction_id", unique=True)
-        await self.transactions.create_index("channel_id")
-        await self.transactions.create_index("stage")
-        await self.users.create_index("user_id", unique=True)
-        await self.blacklist.create_index("user_id", unique=True)
-        await self.logs.create_index("timestamp")
-        # Unique compound index prevents duplicate feedback inserts under race conditions
-        await self.feedback.create_index(
-            [("transaction_id", 1), ("reviewer_id", 1)], unique=True
-        )
-        log.info("Database indexes ensured.")
-
-    # --- Transactions ---
-
-    async def create_transaction(self, data: dict) -> None:
-        await self.transactions.insert_one(data)
-
-    async def get_transaction(self, transaction_id: str) -> Optional[dict]:
-        return await self.transactions.find_one({"transaction_id": transaction_id})
-
-    async def get_transaction_by_channel(self, channel_id: int) -> Optional[dict]:
-        return await self.transactions.find_one({"channel_id": channel_id})
-
-    async def update_transaction(self, transaction_id: str, update: dict) -> None:
-        update["updated_at"] = datetime.now(timezone.utc)
-        await self.transactions.update_one(
-            {"transaction_id": transaction_id},
-            {"$set": update},
-        )
-
-    async def get_active_transactions(self) -> list[dict]:
-        cursor = self.transactions.find({"stage": {"$in": list(Stage.ACTIVE_STAGES)}})
-        return await cursor.to_list(length=None)
-
-    async def get_user_active_transaction(self, user_id: int) -> Optional[dict]:
-        return await self.transactions.find_one({
-            "stage": {"$in": list(Stage.ACTIVE_STAGES)},
-            "$or": [
-                {"sender_id": user_id},
-                {"receiver_id": user_id},
-                {"initiator_id": user_id},
-                {"other_id": user_id},
-            ],
-        })
-
-    # --- Users ---
-
-    async def get_user(self, user_id: int) -> dict:
-        doc = await self.users.find_one({"user_id": user_id})
-        if doc is None:
-            doc = {
-                "user_id": user_id,
-                "completed_deals": 0,
-                "total_volume_usd": 0.0,
-                "total_volume_ltc": 0.0,
-                "feedback_count": 0,
-                "rating_sum": 0,
-                "average_rating": 0.0,
-                "created_at": datetime.now(timezone.utc),
-            }
-            try:
-                await self.users.insert_one(doc)
-            except Exception:
-                pass
-        return doc
-
-    async def update_user(self, user_id: int, update: dict) -> None:
-        await self.users.update_one({"user_id": user_id}, {"$set": update}, upsert=True)
-
-    async def increment_user(self, user_id: int, inc: dict) -> None:
-        await self.users.update_one({"user_id": user_id}, {"$inc": inc}, upsert=True)
-
-    # --- Feedback ---
-
-    async def add_feedback(self, data: dict) -> None:
-        await self.feedback.insert_one(data)
-
-    async def get_user_feedback(self, user_id: int) -> list[dict]:
-        cursor = self.feedback.find({"target_id": user_id}).sort("created_at", -1)
-        return await cursor.to_list(length=None)
-
-    # --- Settings ---
-
-    async def get_setting(self, key: str) -> Optional[Any]:
-        doc = await self.settings.find_one({"key": key})
-        return doc["value"] if doc else None
-
-    async def set_setting(self, key: str, value: Any) -> None:
-        await self.settings.update_one(
-            {"key": key}, {"$set": {"key": key, "value": value}}, upsert=True
-        )
-
-    # --- Blacklist ---
-
-    async def blacklist_user(self, user_id: int, reason: str, mod_id: int) -> None:
-        await self.blacklist.update_one(
-            {"user_id": user_id},
-            {"$set": {
-                "user_id": user_id,
-                "reason": reason,
-                "mod_id": mod_id,
-                "created_at": datetime.now(timezone.utc),
-            }},
-            upsert=True,
-        )
-
-    async def unblacklist_user(self, user_id: int) -> None:
-        await self.blacklist.delete_one({"user_id": user_id})
-
-    async def is_blacklisted(self, user_id: int) -> bool:
-        return bool(await self.blacklist.find_one({"user_id": user_id}))
-
-    # --- Logs ---
-
-    async def add_log(self, event: str, data: dict) -> None:
-        await self.logs.insert_one({
-            "event": event,
-            "data": data,
-            "timestamp": datetime.now(timezone.utc),
-        })
-
-    # --- Statistics ---
-
-    async def get_global_stats(self) -> dict:
-        total     = await self.transactions.count_documents({})
-        completed = await self.transactions.count_documents({"stage": Stage.COMPLETED})
-        cancelled = await self.transactions.count_documents({"stage": Stage.CANCELLED})
-        disputed  = await self.transactions.count_documents({"stage": Stage.DISPUTED})
-        pipeline  = [{"$group": {"_id": None,
-                                  "usd": {"$sum": "$amount_usd"},
-                                  "ltc": {"$sum": "$amount_ltc"}}}]
-        vol = await self.transactions.aggregate(pipeline).to_list(1)
-        return {
-            "total": total, "completed": completed,
-            "cancelled": cancelled, "disputed": disputed,
-            "total_usd": vol[0]["usd"] if vol else 0.0,
-            "total_ltc": vol[0]["ltc"] if vol else 0.0,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Aprione API client
-# ---------------------------------------------------------------------------
-
-class AprionClient:
-    """Async Aprione LTC API wrapper with exponential backoff."""
-
-    def __init__(self, account: str, transfer_key: str) -> None:
-        self.account = account
-        self.transfer_key = transfer_key
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def _session_get(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    async def _request(self, method: str, path: str, **kwargs: Any) -> dict:
-        session = await self._session_get()
-        url = f"{APRIONE_BASE}{path}"
-        last_exc: Exception = RuntimeError("No attempts made")
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with session.request(
-                    method, url, timeout=aiohttp.ClientTimeout(total=15), **kwargs
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json(content_type=None)
-                    text = await resp.text()
-                    log.warning("Aprione %s %s → %s: %s", method, path, resp.status, text[:200])
-                    last_exc = RuntimeError(f"HTTP {resp.status}: {text[:200]}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_exc = exc
-                log.warning("Aprione error attempt %d/%d: %s", attempt + 1, MAX_RETRIES, exc)
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_BACKOFF_BASE ** attempt)
-        raise last_exc
-
-    async def create_address(self) -> str:
-        """Create a unique LTC deposit address and return the address string."""
-        data = await self._request(
-            "POST",
-            f"/accounts/{self.account}/addresses",
-            json={"currency": "ltc"},
-        )
-        addr = data.get("address") or data.get("id") or data.get("addr")
-        if not addr:
-            raise RuntimeError(
-                f"Apirone create_address returned no address field. Response: {data}"
-            )
-        return addr
-
-    async def get_address_history(self, address: str) -> dict:
-        # Do NOT pass ?currency=ltc — the address is already LTC-specific and
-        # adding that param causes Apirone to return an empty txs list.
-        return await self._request(
-            "GET",
-            f"/accounts/{self.account}/addresses/{address}/history",
-        )
-
-    async def get_ltc_price_usd(self) -> float:
-        """Fetch live LTC/USD price from CoinGecko (no key required)."""
-        session = await self._session_get()
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
-        last_exc: Exception = RuntimeError("No attempts made")
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(
-                            f"CoinGecko returned HTTP {resp.status}: {await resp.text()}"
-                        )
-                    data = await resp.json(content_type=None)
-                    price = data.get("litecoin", {}).get("usd")
-                    if price is None:
-                        raise RuntimeError(
-                            f"CoinGecko response missing litecoin.usd field: {data}"
-                        )
-                    return float(price)
-            except Exception as exc:
-                last_exc = exc
-                log.warning("CoinGecko attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, exc)
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_BACKOFF_BASE ** attempt)
-        raise last_exc
-
-    async def withdraw(self, destination: str, amount_ltc: float) -> dict:
-        """
-        Send exactly *amount_ltc* LTC to *destination*.
-        Fee is subtracted FROM that amount, so the bot never sends more than received.
-        Raises ValueError for dust-level amounts (< 1 000 sat).
-        """
-        amount_sat = int(round(amount_ltc * 1e8))
-        if amount_sat < 1000:
-            raise ValueError(
-                f"Withdrawal too small: {amount_sat} sat ({amount_ltc:.8f} LTC). "
-                "Minimum is 1 000 sat."
-            )
-        log.info(
-            "Withdrawal → %s  amount=%.8f LTC (%d sat), fee subtracted from amount",
-            destination, amount_ltc, amount_sat,
-        )
-        return await self._request(
-            "POST",
-            f"/accounts/{self.account}/transfer",
-            json={
-                "currency": "ltc",
-                "transfer_key": self.transfer_key,
-                "destinations": [{"address": destination, "amount": amount_sat}],
-                "subtract_fee_from_amount": True,
-            },
-        )
-
-    async def get_account_info(self) -> dict:
-        """Return the Apirone account object (includes balance fields)."""
-        return await self._request("GET", f"/accounts/{self.account}")
-
-    @staticmethod
-    def _extract_satoshis(value: Any) -> Optional[int]:
-        """
-        Try to extract a satoshi integer from *value*.
-        Accepts: plain int, plain float, numeric string.
-        Returns None if the value cannot be interpreted as satoshis.
-        """
-        if value is None:
-            return None
-        try:
-            f = float(value)
-            # Large values are already satoshis; small values are LTC — convert.
-            return int(f) if f >= 1000 else int(round(f * 1e8))
-        except (TypeError, ValueError):
-            return None
-
-    async def get_account_balance_ltc(self) -> tuple[float, dict]:
-        """
-        Return (spendable_ltc, raw_response) using the correct Apirone v2
-        balance endpoint: GET /accounts/{id}/balance?currency=ltc
-
-        Confirmed live response shape:
-          {"account": "...", "balance": [{"currency": "ltc", "available": 1250968, "total": 1250968}]}
-        """
-        data = await self._request(
-            "GET",
-            f"/accounts/{self.account}/balance",
-            params={"currency": "ltc"},
-        )
-        log.info("Apirone balance response: %s", data)
-
-        sat: int = 0
-        bal = data.get("balance", [])
-
-        if isinstance(bal, list):
-            for entry in bal:
-                if isinstance(entry, dict) and entry.get("currency", "").lower() == "ltc":
-                    sat = int(entry.get("available") or entry.get("total") or 0)
-                    break
-        elif isinstance(bal, dict):
-            # Defensive: some future shape might return a plain dict
-            sat = int(bal.get("available") or bal.get("total") or 0)
-
-        ltc = sat / 1e8
-        log.info("LTC balance: %d sat → %.8f LTC", sat, ltc)
-        return ltc, data
-
-    async def sweep_all(self, destination: str, balance_sat: Optional[int] = None) -> dict:
-        """
-        Sweep funds to *destination*.
-        If *balance_sat* is provided, use it explicitly (most reliable).
-        Otherwise fall back to the 'all' keyword and let Apirone decide.
-        """
-        amount: Any = balance_sat if (balance_sat and balance_sat > 0) else "all"
-        return await self._request(
-            "POST",
-            f"/accounts/{self.account}/transfer",
-            json={
-                "currency": "ltc",
-                "transfer_key": self.transfer_key,
-                "destinations": [{"address": destination, "amount": amount}],
-                "subtract_fee_from_amount": True,
-            },
-        )
-
-    @staticmethod
-    def validate_ltc_address(address: str) -> bool:
-        addr = address.strip()
-        if not addr:
-            return False
-        # LTC mainnet: starts with L, M, 3, or ltc1; length 26-90
-        if addr.startswith(("L", "M", "3", "ltc1")) and 26 <= len(addr) <= 90:
-            return True
-        return False
-
-    async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-
-# ---------------------------------------------------------------------------
-# Base view: persistent, re-validates from DB before every action
-# ---------------------------------------------------------------------------
-
-class BaseView(discord.ui.View):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.transaction_id = transaction_id
-
-    async def get_tx(self) -> Optional[dict]:
-        return await self.bot.db.get_transaction(self.transaction_id)
-
-    async def require_stage(
-        self,
-        interaction: discord.Interaction,
-        *stages: str,
-    ) -> Optional[dict]:
-        tx = await self.get_tx()
-        if tx is None:
-            await interaction.response.send_message(
-                "❌ Transaction not found.", ephemeral=True
-            )
-            return None
-        if tx["stage"] not in stages:
-            await interaction.response.send_message(
-                "❌ This action is no longer available at this stage.", ephemeral=True
-            )
-            return None
-        if tx.get("frozen") and not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "❌ This trade is frozen. Contact an admin.", ephemeral=True
-            )
-            return None
-        return tx
-
-    async def require_participant(
-        self,
-        interaction: discord.Interaction,
-        tx: dict,
-    ) -> bool:
-        uid = interaction.user.id
-        if uid not in (
-            tx.get("sender_id"),
-            tx.get("receiver_id"),
-            tx.get("initiator_id"),
-            tx.get("other_id"),
-        ):
-            await interaction.response.send_message(
-                "❌ Only trade participants may use these buttons.", ephemeral=True
-            )
-            return False
-        return True
-
-    def disable_all(self) -> None:
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-
-
-# ---------------------------------------------------------------------------
-# Helper: cancel trade
-# ---------------------------------------------------------------------------
-
-async def do_cancel(
-    bot: "AutoMMBot",
-    transaction_id: str,
-    cancelled_by: discord.Member,
-    reason: str,
-    interaction: Optional[discord.Interaction] = None,
-    channel: Optional[discord.TextChannel] = None,
-    outcome: str = "cancelled",
-) -> None:
-    await bot.db.update_transaction(transaction_id, {
-        "stage": Stage.CANCELLED,
-        "cancelled_by": cancelled_by.id,
-        "cancel_reason": reason,
-        "cancelled_at": datetime.now(timezone.utc),
-    })
-    embed = make_embed(
-        title="❌ Trade Cancelled",
-        description=f"**Reason:** {reason}",
-        color=COLOR_DANGER,
-        fields=[("Transaction ID", f"`{transaction_id}`", False)],
+def _build_purchase_summary_embed(cat: dict, qty: int) -> discord.Embed:
+    """Build the Purchase Summary embed (Image 2 style)."""
+    is_infinite = bool(cat.get("infinite_stock"))
+    stock_count = len(cat.get("stock", [])) if not is_infinite else 9999
+    stock_str   = "♾️ Unlimited" if is_infinite else str(stock_count)
+    total_usd   = round(cat["price_usd"] * qty, 2)
+    stats = (
+        f"Available Stock: {stock_str}\n"
+        f"Selected Qty: {qty}\n"
+        f"Total Price: ${total_usd}"
     )
-    if interaction:
-        try:
-            await interaction.response.edit_message(embed=embed, view=None)
-        except Exception:
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(embed=embed)
-                else:
-                    ch = channel or interaction.channel
-                    if ch:
-                        await ch.send(embed=embed)
-            except Exception:
-                pass
-    elif channel:
-        await channel.send(embed=embed)
-
-    tx = await bot.db.get_transaction(transaction_id)
-    if tx:
-        guild = bot.get_guild(tx["guild_id"])
-        if guild:
-            await bot.post_log_embed(guild, make_embed(
-                title="❌ Trade Cancelled",
-                color=COLOR_DANGER,
-                fields=[
-                    ("Transaction ID", f"`{transaction_id}`", True),
-                    ("Cancelled By",   cancelled_by.mention, True),
-                    ("Reason",         reason, False),
-                ],
-            ))
-    await bot.db.add_log("trade_cancelled", {
-        "transaction_id": transaction_id,
-        "cancelled_by": cancelled_by.id,
-        "reason": reason,
-    })
-
-    # Send transcript on refund / cancel
-    tx2 = await bot.db.get_transaction(transaction_id)
-    if tx2:
-        ch2: Optional[discord.TextChannel] = channel or (interaction.channel if interaction else None)
-        if ch2 is None and tx2.get("channel_id"):
-            guild2 = bot.get_guild(tx2["guild_id"])
-            if guild2:
-                ch2 = guild2.get_channel(tx2["channel_id"])  # type: ignore[assignment]
-        if ch2:
-            await send_deal_transcript(bot, ch2, tx2, outcome=outcome)
-
-
-# ---------------------------------------------------------------------------
-# Stage 1: Open AutoMM modal + panel button
-# ---------------------------------------------------------------------------
-
-class OpenAutoMMModal(discord.ui.Modal, title="Open AutoMM Trade"):
-    other_user_id = discord.ui.TextInput(
-        label="Other User's ID",
-        placeholder="Right-click user → Copy ID",
-        required=True,
-        max_length=25,
-    )
-
-    def __init__(self, bot: "AutoMMBot") -> None:
-        super().__init__()
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        guild     = interaction.guild
-        initiator = interaction.user
-
-        # Resolve other user
-        try:
-            other_id = int(self.other_user_id.value.strip())
-        except ValueError:
-            await interaction.followup.send("❌ Invalid user ID.", ephemeral=True)
-            return
-
-        try:
-            other = guild.get_member(other_id) or await guild.fetch_member(other_id)
-        except discord.NotFound:
-            await interaction.followup.send(
-                "❌ User not found in this server.", ephemeral=True
-            )
-            return
-
-        if other.bot:
-            await interaction.followup.send("❌ You cannot trade with a bot.", ephemeral=True)
-            return
-        if other.id == initiator.id:
-            await interaction.followup.send(
-                "❌ You cannot trade with yourself.", ephemeral=True
-            )
-            return
-
-        # Blacklist check
-        for uid in (initiator.id, other.id):
-            if await self.bot.db.is_blacklisted(uid):
-                await interaction.followup.send(
-                    f"❌ <@{uid}> is blacklisted and cannot participate in trades.",
-                    ephemeral=True,
-                )
-                return
-
-        # Active trade check
-        for uid in (initiator.id, other.id):
-            existing = await self.bot.db.get_user_active_transaction(uid)
-            if existing:
-                await interaction.followup.send(
-                    f"❌ <@{uid}> is already in an active trade (`{existing['transaction_id']}`).",
-                    ephemeral=True,
-                )
-                return
-
-        # Generate transaction ID
-        transaction_id = str(uuid.uuid4())[:8].upper()
-
-        # Create ticket channel
-        category_id = await self.bot.db.get_setting("ticket_category_id")
-        category = guild.get_channel(int(category_id)) if category_id else None
-
-        overwrites: dict[Any, discord.PermissionOverwrite] = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            initiator:          discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            other:              discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            guild.me:           discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, manage_channels=True
-            ),
-        }
-        for role in guild.roles:
-            if role.permissions.administrator:
-                overwrites[role] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True
-                )
-
-        ticket_ch = await guild.create_text_channel(
-            name=f"trade-{transaction_id.lower()}",
-            category=category,  # type: ignore[arg-type]
-            overwrites=overwrites,
-            reason=f"AutoMM trade {transaction_id}",
-        )
-
-        # Persist transaction document
-        now = datetime.now(timezone.utc)
-        await self.bot.db.create_transaction({
-            "transaction_id":          transaction_id,
-            "channel_id":              ticket_ch.id,
-            "guild_id":                guild.id,
-            "stage":                   Stage.ROLE_SELECT,
-            "initiator_id":            initiator.id,
-            "other_id":                other.id,
-            "sender_id":               None,
-            "receiver_id":             None,
-            "amount_usd":              None,
-            "amount_ltc":              None,
-            "ltc_price":               None,
-            "deposit_address":         None,
-            "deposit_txid":            None,
-            "deposit_confirmed":       False,
-            "confirmations":           0,
-            "wrong_amount_notified":   False,
-            "withdrawal_address":      None,
-            "withdrawal_txid":         None,
-            "sender_tos":              None,
-            "receiver_tos":            None,
-            "sender_tos_accepted":     False,
-            "receiver_tos_accepted":   False,
-            "sender_confirmed":        False,
-            "receiver_confirmed":      False,
-            "release_confirmed":       False,
-            "feedback_sent_sender":    False,
-            "feedback_sent_receiver":  False,
-            "role_select_message_id":  None,
-            "deposit_message_id":      None,
-            "frozen":                  False,
-            "created_at":              now,
-            "updated_at":              now,
-        })
-
-        await interaction.followup.send(
-            f"✅ Trade ticket created: {ticket_ch.mention}", ephemeral=True
-        )
-
-        # Notify both participants via DM that a ticket has been opened with them
-        await self.bot.notify_user_ticket_opened(other, ticket_ch, transaction_id, initiator)
-        await self.bot.notify_user_ticket_opened(initiator, ticket_ch, transaction_id, other)
-
-        # Send role selection embed
-        embed = make_embed(
-            title=f"🔄 AutoMM Trade — `{transaction_id}`",
-            description=(
-                f"**Participants:** {initiator.mention} & {other.mention}\n\n"
-                "Select your role, then both participants press **Confirm**.\n"
-                "**Sender** pays LTC · **Receiver** delivers the goods/service."
-            ),
-            color=COLOR_PRIMARY,
-            fields=[
-                ("Sender Role",   "_Not selected_", True),
-                ("Receiver Role", "_Not selected_", True),
-                ("Transaction ID", f"`{transaction_id}`", False),
-            ],
-        )
-        view = RoleSelectView(self.bot, transaction_id, initiator.id, other.id)
-        msg = await ticket_ch.send(
-            content=f"{initiator.mention} {other.mention}",
-            embed=embed,
-            view=view,
-        )
-        await self.bot.db.update_transaction(transaction_id, {"role_select_message_id": msg.id})
-        await self.bot.db.add_log("trade_opened", {
-            "transaction_id": transaction_id,
-            "initiator_id":   initiator.id,
-            "other_id":       other.id,
-            "channel_id":     ticket_ch.id,
-        })
-        await self.bot.post_log_embed(guild, make_embed(
-            title="📂 Trade Opened",
-            color=COLOR_INFO,
-            fields=[
-                ("Transaction ID", f"`{transaction_id}`", True),
-                ("Initiator",      initiator.mention, True),
-                ("Counterparty",   other.mention, True),
-                ("Channel",        ticket_ch.mention, False),
-            ],
-        ))
-
-
-class PanelView(discord.ui.View):
-    """Persistent Open AutoMM button displayed in the panel embed."""
-
-    def __init__(self, bot: "AutoMMBot") -> None:
-        super().__init__(timeout=None)
-        self.bot = bot
-
-    @discord.ui.button(
-        label="Open AutoMM",
-        style=discord.ButtonStyle.primary,
-        emoji="🔄",
-        custom_id="panel_open_automm",
-    )
-    async def open_automm(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        # Check required user role (DB setting takes priority over config/env)
-        raw = await self.bot.db.get_setting("user_role_id") or (
-            str(USER_ROLE_ID) if USER_ROLE_ID else None
-        )
-        if raw:
-            required_id = int(raw)
-            if not any(r.id == required_id for r in interaction.user.roles):
-                role = interaction.guild.get_role(required_id)
-                mention = role.mention if role else f"<@&{required_id}>"
-                await interaction.response.send_message(
-                    f"❌ You do not have the required role {mention} to open a trade.",
-                    ephemeral=True,
-                )
-                return
-        await interaction.response.send_modal(OpenAutoMMModal(self.bot))
-
-
-# ---------------------------------------------------------------------------
-# Stage 2: Role selection
-# ---------------------------------------------------------------------------
-
-class RoleSelectView(BaseView):
-    """Single embed view: role selection + confirmation in one place."""
-
-    def __init__(
-        self,
-        bot: "AutoMMBot",
-        transaction_id: str,
-        initiator_id: int,
-        other_id: int,
-    ) -> None:
-        super().__init__(bot, transaction_id)
-        self.initiator_id = initiator_id
-        self.other_id     = other_id
-
-        sender_btn = discord.ui.Button(
-            label="Sender",
-            style=discord.ButtonStyle.primary,
-            emoji="💸",
-            custom_id=f"rs_sender_{transaction_id}",
-        )
-        sender_btn.callback = self._on_sender
-        self.add_item(sender_btn)
-
-        receiver_btn = discord.ui.Button(
-            label="Receiver",
-            style=discord.ButtonStyle.secondary,
-            emoji="📦",
-            custom_id=f"rs_receiver_{transaction_id}",
-        )
-        receiver_btn.callback = self._on_receiver
-        self.add_item(receiver_btn)
-
-        confirm_btn = discord.ui.Button(
-            label="Confirm",
-            style=discord.ButtonStyle.success,
-            emoji="✅",
-            custom_id=f"rs_confirm_{transaction_id}",
-        )
-        confirm_btn.callback = self._on_confirm
-        self.add_item(confirm_btn)
-
-        cancel_btn = discord.ui.Button(
-            label="Cancel",
-            style=discord.ButtonStyle.danger,
-            emoji="❌",
-            custom_id=f"rs_cancel_{transaction_id}",
-        )
-        cancel_btn.callback = self._on_cancel
-        self.add_item(cancel_btn)
-
-    def _mention(self, guild: discord.Guild, mid: Optional[int]) -> str:
-        if mid is None:
-            return "_Not selected_"
-        m = guild.get_member(mid)
-        return m.mention if m else f"<@{mid}>"
-
-    async def _refresh_embed(
-        self,
-        interaction: discord.Interaction,
-        tx: dict,
-        sender_id: Optional[int],
-        receiver_id: Optional[int],
-    ) -> None:
-        """Edit the message in-place to show current role selections."""
-        guild = interaction.guild
-        if sender_id and receiver_id:
-            title       = f"✅ Roles Selected — `{self.transaction_id}`"
-            description = (
-                "Both roles selected. "
-                "Each participant must press **Confirm** to continue."
-            )
-            color = COLOR_SUCCESS
-        else:
-            title       = f"🔄 AutoMM Trade — `{self.transaction_id}`"
-            description = (
-                "Select your role, then both participants press **Confirm**.\n"
-                "**Sender** pays LTC · **Receiver** delivers the goods/service."
-            )
-            color = COLOR_PRIMARY
-
-        embed = make_embed(
-            title=title,
-            description=description,
-            color=color,
-            fields=[
-                ("Sender Role",   self._mention(guild, sender_id),   True),
-                ("Receiver Role", self._mention(guild, receiver_id), True),
-                ("Transaction ID", f"`{self.transaction_id}`",       False),
-            ],
-        )
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    async def _pick_role(self, interaction: discord.Interaction, role: str) -> None:
-        tx = await self.require_stage(interaction, Stage.ROLE_SELECT)
-        if tx is None:
-            return
-        uid = interaction.user.id
-        if uid not in (tx["initiator_id"], tx["other_id"]):
-            await interaction.response.send_message(
-                "❌ Only trade participants may choose roles.", ephemeral=True
-            )
-            return
-
-        sender_id   = tx.get("sender_id")
-        receiver_id = tx.get("receiver_id")
-
-        if role == "sender":
-            if sender_id is not None and sender_id != uid:
-                await interaction.response.send_message("❌ Sender role already taken.", ephemeral=True)
-                return
-            if receiver_id == uid:
-                await interaction.response.send_message("❌ You are already the Receiver.", ephemeral=True)
-                return
-            sender_id = uid
-        else:
-            if receiver_id is not None and receiver_id != uid:
-                await interaction.response.send_message("❌ Receiver role already taken.", ephemeral=True)
-                return
-            if sender_id == uid:
-                await interaction.response.send_message("❌ You are already the Sender.", ephemeral=True)
-                return
-            receiver_id = uid
-
-        await self.bot.db.update_transaction(self.transaction_id, {
-            "sender_id": sender_id, "receiver_id": receiver_id,
-        })
-        await self._refresh_embed(interaction, tx, sender_id, receiver_id)
-
-    async def _on_sender(self, interaction: discord.Interaction) -> None:
-        await self._pick_role(interaction, "sender")
-
-    async def _on_receiver(self, interaction: discord.Interaction) -> None:
-        await self._pick_role(interaction, "receiver")
-
-    async def _on_confirm(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.ROLE_SELECT)
-        if tx is None:
-            return
-        uid         = interaction.user.id
-        sender_id   = tx.get("sender_id")
-        receiver_id = tx.get("receiver_id")
-
-        # Both roles must be filled first
-        if not (sender_id and receiver_id):
-            await interaction.response.send_message(
-                "❌ Both participants must select their roles before confirming.", ephemeral=True
-            )
-            return
-
-        if uid not in (sender_id, receiver_id):
-            await interaction.response.send_message("❌ Not a participant.", ephemeral=True)
-            return
-
-        update: dict[str, Any] = (
-            {"sender_confirmed": True} if uid == sender_id
-            else {"receiver_confirmed": True}
-        )
-        await self.bot.db.update_transaction(self.transaction_id, update)
-        tx = await self.get_tx()
-        assert tx is not None
-
-        if tx["sender_confirmed"] and tx["receiver_confirmed"]:
-            await self.bot.db.update_transaction(self.transaction_id, {
-                "stage": Stage.TOS,
-                "sender_confirmed": False,
-                "receiver_confirmed": False,
-            })
-            self.disable_all()
-            await interaction.response.edit_message(
-                embed=make_embed(
-                    title="✅ Roles Confirmed",
-                    color=COLOR_SUCCESS,
-                ),
-                view=self,
-            )
-            await _start_tos_stage(self.bot, interaction.channel, tx)
-        else:
-            who = "Sender" if uid == sender_id else "Receiver"
-            await interaction.response.send_message(
-                f"✅ {who} confirmed. Waiting for the other participant to also confirm.",
-                ephemeral=True,
-            )
-
-    async def _on_cancel(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.ROLE_SELECT)
-        if tx is None:
-            return
-        if not await self.require_participant(interaction, tx):
-            return
-        self.disable_all()
-        await interaction.response.edit_message(view=self)
-        await do_cancel(
-            self.bot, self.transaction_id, interaction.user,
-            f"Cancelled by {interaction.user.display_name}", channel=interaction.channel
-        )
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: Personal ToS
-# ---------------------------------------------------------------------------
-
-async def _start_tos_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    sid = tx["sender_id"]
-    rid = tx["receiver_id"]
-    tid = tx["transaction_id"]
-
-    await channel.send(
-        content=f"<@{sid}>",
-        embed=make_embed(
-            title="📦 Conditions — Sender",
-            description="Set your conditions for this trade, or skip.",
-            color=COLOR_PRIMARY,
-        ),
-        view=TosPromptView(bot, tid, sid, is_sender=True),
-    )
-    await channel.send(
-        content=f"<@{rid}>",
-        embed=make_embed(
-            title="📋 Terms of Service — Receiver",
-            description="Set your Terms of Service for this trade, or skip.",
-            color=COLOR_PRIMARY,
-        ),
-        view=TosPromptView(bot, tid, rid, is_sender=False),
-    )
-
-
-async def _check_tos_complete(
-    bot: "AutoMMBot", channel: discord.TextChannel, transaction_id: str
-) -> None:
-    """Advance to Amount stage once both participants resolved ToS."""
-    tx = await bot.db.get_transaction(transaction_id)
-    if tx is None or tx["stage"] != Stage.TOS:
-        return
-
-    sender_tos   = tx.get("sender_tos")
-    receiver_tos = tx.get("receiver_tos")
-
-    sender_done = sender_tos is not None and (
-        sender_tos == "__skip__" or tx.get("receiver_tos_accepted")
-    )
-    receiver_done = receiver_tos is not None and (
-        receiver_tos == "__skip__" or tx.get("sender_tos_accepted")
-    )
-
-    if sender_done and receiver_done:
-        await bot.db.update_transaction(transaction_id, {"stage": Stage.AMOUNT})
-        await _start_amount_stage(bot, channel, tx)
-
-
-class TosModal(discord.ui.Modal, title="Set Conditions"):
-    tos_text = discord.ui.TextInput(
-        label="Details",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000,
-    )
-
-    def __init__(
-        self,
-        bot: "AutoMMBot",
-        transaction_id: str,
-        user_id: int,
-        is_sender: bool = False,
-    ) -> None:
-        if is_sender:
-            super().__init__(title="Set Conditions")
-            self.tos_text.label = "Your conditions for this trade"
-        else:
-            super().__init__(title="Set Terms of Service")
-            self.tos_text.label = "Your Terms of Service"
-        self.bot            = bot
-        self.transaction_id = transaction_id
-        self.user_id        = user_id
-        self.is_sender      = is_sender
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None:
-            await interaction.response.send_message("❌ Transaction not found.", ephemeral=True)
-            return
-
-        is_sender  = self.user_id == tx["sender_id"]
-        other_id   = tx["receiver_id"] if is_sender else tx["sender_id"]
-        field_key  = "sender_tos" if is_sender else "receiver_tos"
-        tos_text   = self.tos_text.value
-
-        await self.bot.db.update_transaction(self.transaction_id, {field_key: tos_text})
-
-        if is_sender:
-            await interaction.response.send_message("✅ Conditions recorded.", ephemeral=True)
-            await interaction.channel.send(
-                content=f"<@{other_id}>",
-                embed=make_embed(
-                    title="📦 Sender's Conditions",
-                    description=(
-                        f"The **Sender** has set the following conditions:\n\n"
-                        f"```\n{tos_text}\n```"
-                    ),
-                    color=COLOR_PRIMARY,
-                ),
-                view=TosAcceptView(self.bot, self.transaction_id, self.user_id, other_id, True),
-            )
-        else:
-            await interaction.response.send_message("✅ Terms of Service recorded.", ephemeral=True)
-            await interaction.channel.send(
-                content=f"<@{other_id}>",
-                embed=make_embed(
-                    title="📋 Receiver's Terms of Service",
-                    description=(
-                        f"The **Receiver** has set the following Terms of Service:\n\n"
-                        f"```\n{tos_text}\n```"
-                    ),
-                    color=COLOR_PRIMARY,
-                ),
-                view=TosAcceptView(self.bot, self.transaction_id, self.user_id, other_id, False),
-            )
-
-
-class TosPromptView(discord.ui.View):
-    def __init__(
-        self,
-        bot: "AutoMMBot",
-        transaction_id: str,
-        user_id: int,
-        is_sender: bool = False,
-        edit_mode: bool = False,
-    ) -> None:
-        super().__init__(timeout=None)
-        self.bot            = bot
-        self.transaction_id = transaction_id
-        self.user_id        = user_id
-        self.is_sender      = is_sender
-
-        set_btn = discord.ui.Button(
-            label="Edit" if edit_mode else "Set",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"tos_set_{transaction_id}_{user_id}",
-        )
-        set_btn.callback = self._on_set
-        self.add_item(set_btn)
-
-        skip_btn = discord.ui.Button(
-            label="Skip",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"tos_skip_{transaction_id}_{user_id}",
-        )
-        skip_btn.callback = self._on_skip
-        self.add_item(skip_btn)
-
-    def _disable_all(self) -> None:
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-
-    async def _on_set(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your prompt.", ephemeral=True)
-            return
-        tx = await self.bot.db.get_transaction_by_channel(interaction.channel_id)
-        is_sender = bool(tx and self.user_id == tx["sender_id"])
-        self._disable_all()
-        await interaction.response.send_modal(
-            TosModal(self.bot, self.transaction_id, self.user_id, is_sender=is_sender)
-        )
-        await interaction.message.edit(view=self)
-
-    async def _on_skip(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your prompt.", ephemeral=True)
-            return
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None:
-            return
-        is_sender = self.user_id == tx["sender_id"]
-        field = "sender_tos" if is_sender else "receiver_tos"
-        await self.bot.db.update_transaction(self.transaction_id, {field: "__skip__"})
-        self._disable_all()
-        title = "📦 Conditions" if is_sender else "📋 Terms of Service"
-        await interaction.response.edit_message(
-            embed=make_embed(title, "Skipped.", color=COLOR_PRIMARY), view=self
-        )
-        await _check_tos_complete(self.bot, interaction.channel, self.transaction_id)
-
-
-class TosAcceptView(discord.ui.View):
-    def __init__(
-        self,
-        bot: "AutoMMBot",
-        transaction_id: str,
-        tos_author_id: int,
-        acceptor_id: int,
-        author_is_sender: bool,
-    ) -> None:
-        super().__init__(timeout=None)
-        self.bot              = bot
-        self.transaction_id   = transaction_id
-        self.tos_author_id    = tos_author_id
-        self.acceptor_id      = acceptor_id
-        self.author_is_sender = author_is_sender
-
-        agree_btn = discord.ui.Button(
-            label="Agree",
-            style=discord.ButtonStyle.success,
-            custom_id=f"tos_accept_{transaction_id}_{acceptor_id}",
-        )
-        agree_btn.callback = self._on_accept
-        self.add_item(agree_btn)
-
-        decline_btn = discord.ui.Button(
-            label="Decline",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"tos_decline_{transaction_id}_{acceptor_id}",
-        )
-        decline_btn.callback = self._on_decline
-        self.add_item(decline_btn)
-
-    def _disable_all(self) -> None:
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-
-    async def _on_accept(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.acceptor_id:
-            await interaction.response.send_message("❌ Not your prompt.", ephemeral=True)
-            return
-        field = "receiver_tos_accepted" if self.author_is_sender else "sender_tos_accepted"
-        await self.bot.db.update_transaction(self.transaction_id, {field: True})
-        self._disable_all()
-        title = "📦 Conditions" if self.author_is_sender else "📋 Terms of Service"
-        await interaction.response.edit_message(
-            embed=make_embed(title, "Agreed.", color=COLOR_PRIMARY), view=self
-        )
-        await _check_tos_complete(self.bot, interaction.channel, self.transaction_id)
-
-    async def _on_decline(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.acceptor_id:
-            await interaction.response.send_message("❌ Not your prompt.", ephemeral=True)
-            return
-        self._disable_all()
-        title  = "📦 Conditions" if self.author_is_sender else "📋 Terms of Service"
-        f_key  = "sender_tos"          if self.author_is_sender else "receiver_tos"
-        a_key  = "receiver_tos_accepted" if self.author_is_sender else "sender_tos_accepted"
-        await interaction.response.edit_message(
-            embed=make_embed(title, "Declined.", color=COLOR_PRIMARY), view=self
-        )
-        # Reset the author's submission so they can edit and resubmit
-        await self.bot.db.update_transaction(self.transaction_id, {f_key: None, a_key: False})
-        # Re-prompt the author to edit or skip
-        re_view = TosPromptView(
-            self.bot, self.transaction_id, self.tos_author_id,
-            is_sender=self.author_is_sender, edit_mode=True,
-        )
-        desc = (
-            "Your conditions were declined. Edit and resubmit, or skip."
-            if self.author_is_sender else
-            "Your Terms of Service were declined. Edit and resubmit, or skip."
-        )
-        await interaction.channel.send(
-            content=f"<@{self.tos_author_id}>",
-            embed=make_embed(title, desc, color=COLOR_PRIMARY),
-            view=re_view,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Emoji helpers — fetch configurable emojis from DB (with defaults)
-# ---------------------------------------------------------------------------
-
-async def _get_star_emoji(bot: "AutoMMBot") -> str:
-    """Return the server's custom star emoji (default: 🌟)."""
-    return await bot.db.get_setting("star_emoji") or "🌟"
-
-async def _get_arrow_emoji(bot: "AutoMMBot") -> str:
-    """Return the server's custom arrow emoji (default: >>)."""
-    return await bot.db.get_setting("arrow_emoji") or ">>"
-
-async def _get_dot_emoji(bot: "AutoMMBot") -> str:
-    """Return the server's custom dot/bullet emoji (default: •)."""
-    return await bot.db.get_setting("dot_emoji") or "•"
-
-
-# ---------------------------------------------------------------------------
-# Stage 4: Amount
-# ---------------------------------------------------------------------------
-
-async def _start_amount_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    view = AmountInputView(bot, tx["transaction_id"], tx["sender_id"])
-    await channel.send(
-        content=f"<@{tx['sender_id']}>",
-        embed=make_embed(
-            title="💵 Enter Trade Amount",
-            description="**Sender**, press the button below to enter the USD amount for this trade.",
-            color=COLOR_INFO,
-        ),
-        view=view,
-    )
-
-
-class AmountModal(discord.ui.Modal, title="Enter Trade Amount (USD)"):
-    amount = discord.ui.TextInput(
-        label="Amount in USD",
-        placeholder="e.g. 150.00",
-        required=True,
-        max_length=15,
-    )
-
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__()
-        self.bot            = bot
-        self.transaction_id = transaction_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            amount_usd = float(
-                self.amount.value.strip().replace("$", "").replace(",", "")
-            )
-            if amount_usd < 0.10:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message(
-                "❌ Invalid amount. Minimum trade amount is **$0.10 USD**.", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            ltc_price = await self.bot.aprion.get_ltc_price_usd()
-        except Exception:
-            await interaction.followup.send(
-                "❌ Could not fetch LTC price. Try again.", ephemeral=True
-            )
-            return
-
-        amount_ltc = round(amount_usd / ltc_price, 8)
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-
-        await self.bot.db.update_transaction(self.transaction_id, {
-            "amount_usd": amount_usd,
-            "amount_ltc": amount_ltc,
-            "ltc_price":  ltc_price,
-        })
-
-        mm_name    = await self.bot.db.get_setting("mm_name") or "AutoMM"
-        star       = await _get_star_emoji(self.bot)
-        arr        = await _get_arrow_emoji(self.bot)
-        guild_icon = (
-            interaction.guild.icon.url
-            if interaction.guild and interaction.guild.icon
-            else None
-        )
-
-        view = AmountAgreeView(self.bot, self.transaction_id)
-        await interaction.channel.send(
-            content=f"<@{tx['sender_id']}> <@{tx['receiver_id']}>",
-            embed=make_embed(
-                title=f"{star} Deal Amount Confirmation {star}",
-                description=(
-                    f"{arr} **Amount : ${amount_usd:,.2f} USD**\n\n"
-                    f"{arr} Accept Or Reject the Deal"
-                ),
-                color=COLOR_SUCCESS,
-                thumbnail_url=guild_icon,
-                footer=mm_name,
-                footer_icon_url=BADGE_IMG,
-            ),
-            view=view,
-        )
-        await interaction.followup.send("✅ Amount set.", ephemeral=True)
-
-
-class AmountInputView(discord.ui.View):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str, sender_id: int) -> None:
-        super().__init__(timeout=None)
-        self.bot            = bot
-        self.transaction_id = transaction_id
-        self.sender_id      = sender_id
-
-        btn = discord.ui.Button(
-            label="Enter Amount",
-            style=discord.ButtonStyle.primary,
-            emoji="💵",
-            custom_id=f"amount_enter_{transaction_id}",
-        )
-        btn.callback = self._on_enter
-        self.add_item(btn)
-
-    async def _on_enter(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.sender_id:
-            await interaction.response.send_message(
-                "❌ Only the Sender may enter the amount.", ephemeral=True
-            )
-            return
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None or tx["stage"] != Stage.AMOUNT:
-            await interaction.response.send_message("❌ Stage mismatch.", ephemeral=True)
-            return
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-        await interaction.response.send_modal(AmountModal(self.bot, self.transaction_id))
-        await interaction.message.edit(view=self)
-
-
-class AmountAgreeView(BaseView):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__(bot, transaction_id)
-
-        agree_btn = discord.ui.Button(
-            label="Accept",
-            style=discord.ButtonStyle.success,
-            custom_id=f"amount_agree_{transaction_id}",
-        )
-        agree_btn.callback = self._on_agree
-        self.add_item(agree_btn)
-
-        cancel_btn = discord.ui.Button(
-            label="Reject",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"amount_cancel_{transaction_id}",
-        )
-        cancel_btn.callback = self._on_cancel
-        self.add_item(cancel_btn)
-
-    async def _on_agree(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.AMOUNT)
-        if tx is None:
-            return
-        if not await self.require_participant(interaction, tx):
-            return
-        uid = interaction.user.id
-        update: dict[str, Any] = (
-            {"sender_confirmed": True} if uid == tx["sender_id"]
-            else {"receiver_confirmed": True}
-        )
-        await self.bot.db.update_transaction(self.transaction_id, update)
-        tx = await self.get_tx()
-        assert tx is not None
-
-        if tx["sender_confirmed"] and tx["receiver_confirmed"]:
-            await self.bot.db.update_transaction(self.transaction_id, {
-                "stage": Stage.DEPOSIT,
-                "sender_confirmed": False,
-                "receiver_confirmed": False,
-            })
-            self.disable_all()
-            await interaction.response.edit_message(view=self)
-            await _start_deposit_stage(self.bot, interaction.channel, tx)
-        else:
-            await interaction.response.send_message(
-                "✅ You agreed. Waiting for the other participant.", ephemeral=True
-            )
-
-    async def _on_cancel(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.AMOUNT)
-        if tx is None:
-            return
-        if not await self.require_participant(interaction, tx):
-            return
-        self.disable_all()
-        await interaction.response.edit_message(view=self)
-        await do_cancel(
-            self.bot, self.transaction_id, interaction.user,
-            f"Cancelled by {interaction.user.display_name}", channel=interaction.channel
-        )
-
-
-# ---------------------------------------------------------------------------
-# Stage 5: Deposit
-# ---------------------------------------------------------------------------
-
-async def _start_deposit_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    try:
-        deposit_address = await bot.aprion.create_address()
-    except Exception as exc:
-        log.error("Failed to create deposit address for %s: %s", tx["transaction_id"], exc)
-        await channel.send(
-            embed=make_embed(
-                title="❌ Address Generation Failed",
-                description="Failed to generate a deposit address. Please contact an admin.",
-                color=COLOR_DANGER,
-            )
-        )
-        return
-
-    await bot.db.update_transaction(tx["transaction_id"], {
-        "deposit_address": deposit_address,
-        "stage": Stage.AWAITING_FUNDS,
-    })
-
-    mm_name = await bot.db.get_setting("mm_name") or "AutoMM"
-    star    = await _get_star_emoji(bot)
-    arr     = await _get_arrow_emoji(bot)
-    view = DepositView(bot, tx["transaction_id"], tx["sender_id"])
-    msg = await channel.send(
-        content=f"<@{tx['sender_id']}>",
-        embed=make_embed(
-            title=f"{star} Waiting For Payment {star}",
-            description=(
-                f"Payment Credentials are Given Below\n\n"
-                f"{arr} **Address** : `{deposit_address}`\n"
-                f"{arr} **Amount to pay** : {tx['amount_ltc']:.8f} LTC\n\n"
-                f"Your payment will be Detected Automatically"
-            ),
-            color=COLOR_PRIMARY,
-            thumbnail_url=LTC_LOGO,
-            footer=mm_name,
-            footer_icon_url=BADGE_IMG,
-        ),
-        view=view,
-    )
-    await bot.db.update_transaction(tx["transaction_id"], {"deposit_message_id": msg.id})
-
-    # Start async payment monitoring
-    bot.loop.create_task(bot.monitor_payment(tx["transaction_id"]))
-
-
-class DepositView(BaseView):
-    def __init__(
-        self, bot: "AutoMMBot", transaction_id: str, sender_id: int
-    ) -> None:
-        super().__init__(bot, transaction_id)
-        self.sender_id = sender_id
-
-        copy_btn = discord.ui.Button(
-            label="Copy Address",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"dep_copy_{transaction_id}",
-        )
-        copy_btn.callback = self._on_copy
-        self.add_item(copy_btn)
-
-        qr_btn = discord.ui.Button(
-            label="QR Code",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"dep_qr_{transaction_id}",
-        )
-        qr_btn.callback = self._on_qrcode
-        self.add_item(qr_btn)
-
-        cancel_btn = discord.ui.Button(
-            label="Cancel",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"dep_cancel_{transaction_id}",
-        )
-        cancel_btn.callback = self._on_cancel
-        self.add_item(cancel_btn)
-
-    async def _on_copy(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.sender_id:
-            await interaction.response.send_message(
-                "❌ Only the Sender may copy the address.", ephemeral=True
-            )
-            return
-        tx = await self.get_tx()
-        if tx is None:
-            await interaction.response.send_message("❌ Transaction not found.", ephemeral=True)
-            return
-        if tx.get("deposit_confirmed"):
-            await interaction.response.send_message(
-                "❌ Payment already detected.", ephemeral=True
-            )
-            return
-        await interaction.response.send_message(tx["deposit_address"])
-        await interaction.followup.send(f"{tx['amount_ltc']:.8f}")
-
-    async def _on_qrcode(self, interaction: discord.Interaction) -> None:
-        tx = await self.get_tx()
-        if tx is None:
-            await interaction.response.send_message("❌ Transaction not found.", ephemeral=True)
-            return
-        address = tx.get("deposit_address", "")
-        qr_url  = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={address}"
-        embed   = discord.Embed(
-            title="📱 QR Code — Scan to Pay",
-            description=f"```\n{address}\n```",
-            color=COLOR_INFO,
-        )
-        embed.set_image(url=qr_url)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def _on_cancel(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.AWAITING_FUNDS, Stage.DEPOSIT)
-        if tx is None:
-            return
-        if tx.get("deposit_confirmed"):
-            await interaction.response.send_message(
-                "❌ Cannot cancel — payment already detected.", ephemeral=True
-            )
-            return
-        if not await self.require_participant(interaction, tx):
-            return
-        self.disable_all()
-        await interaction.response.edit_message(view=self)
-        await do_cancel(
-            self.bot, self.transaction_id, interaction.user,
-            f"Cancelled by {interaction.user.display_name}", channel=interaction.channel
-        )
-
-
-# ---------------------------------------------------------------------------
-# Stage 7: Payment monitoring
-# ---------------------------------------------------------------------------
-
-async def _poll_payment(bot: "AutoMMBot", transaction_id: str) -> bool:
-    """
-    Poll Aprione for a payment on the deposit address.
-    Returns True once payment is fully confirmed.
-    """
-    tx = await bot.db.get_transaction(transaction_id)
-    if tx is None or tx["stage"] not in (Stage.DEPOSIT, Stage.AWAITING_FUNDS):
-        return True  # stop monitoring
-
-    if tx.get("frozen"):
-        return False
-
-    address = tx.get("deposit_address")
-    if not address:
-        return False
-
-    try:
-        history = await bot.aprion.get_address_history(address)
-    except Exception as exc:
-        log.warning("Payment poll error for %s: %s", transaction_id, exc)
-        return False
-
-    # Aprione returns items under various keys depending on version/response shape.
-    # Be defensive: accept a bare list, or a dict wrapping the list under any of
-    # several plausible keys.
-    items: list[dict]
-    if isinstance(history, list):
-        items = history
-    elif isinstance(history, dict):
-        items = (
-            history.get("transactions")
-            or history.get("data")
-            or history.get("items")
-            or history.get("history")
-            or history.get("results")
-            or history.get("txs")
-            or history.get("addresses")
-            or []
-        )
-        # Some shapes nest the list one level deeper, e.g. {"address": {...}, "transactions": [...]}
-        if not items and isinstance(history.get("address"), dict):
-            inner = history["address"]
-            items = (
-                inner.get("transactions")
-                or inner.get("history")
-                or inner.get("txs")
-                or []
-            )
-    else:
-        items = []
-
-    if not items:
-        # Log the raw payload on every poll so admins can diagnose
-        # Apirone response-shape mismatches quickly.
-        poll_count = tx.get("_poll_count", 0) + 1
-        await bot.db.update_transaction(transaction_id, {"_poll_count": poll_count})
-        log.info(
-            "No payment items found yet for %s (address=%s, poll #%d). "
-            "Raw Apirone response keys: %s | Full: %s",
-            transaction_id, address, poll_count,
-            list(history.keys()) if isinstance(history, dict) else type(history).__name__,
-            str(history)[:800],
-        )
-        return False
-
-    expected_ltc = tx["amount_ltc"]
-    guild   = bot.get_guild(tx["guild_id"])
-    channel = guild.get_channel(tx["channel_id"]) if guild else None
-
-    _detected_this_poll = False  # guards against double-fire within one poll cycle
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        raw_amount = (
-            item.get("amount")
-            if item.get("amount") is not None else
-            item.get("value")
-            if item.get("value") is not None else
-            item.get("amount_ltc")
-            if item.get("amount_ltc") is not None else
-            item.get("received_amount")
-            if item.get("received_amount") is not None else
-            0
-        )
-        try:
-            if isinstance(raw_amount, int):
-                # Heuristic: large integers are satoshis, small ones are already LTC.
-                amount_ltc = raw_amount / 1e8 if abs(raw_amount) >= 1000 else float(raw_amount)
-            else:
-                amount_ltc = float(raw_amount)
-        except (TypeError, ValueError):
-            amount_ltc = 0.0
-        # Skip replaced / deleted transactions
-        if item.get("deleted", False):
-            continue
-
-        txid = item.get("txid") or item.get("id") or item.get("hash") or item.get("tx_hash") or ""
-
-        # Apirone signals confirmation via a non-null 'block' dict, NOT a numeric
-        # confirmations count. Map: block present → fully confirmed, absent → 0.
-        block_info = item.get("block")
-        confs = REQUIRED_CONFIRMATIONS if (isinstance(block_info, dict) and block_info) else 0
-
-        # Wrong amount guard — allow ±5 % tolerance.  The LTC price moves
-        # between when the bot quotes the amount and when the sender actually
-        # sends, and minor fee/dust differences can also shift the value.
-        amount_tolerance = max(expected_ltc * 0.05, 0.00001)
-        if amount_ltc > 0 and abs(amount_ltc - expected_ltc) > amount_tolerance:
-            if not tx.get("wrong_amount_notified"):
-                await bot.db.update_transaction(transaction_id, {"wrong_amount_notified": True})
-                msg = (
-                    f"⚠️ **Wrong Amount** in trade `{transaction_id}`: "
-                    f"expected {expected_ltc:.8f} LTC, received {amount_ltc:.8f} LTC."
-                )
-                if channel:
-                    await channel.send(embed=make_embed(
-                        "⚠️ Wrong Amount Received",
-                        f"Expected **{expected_ltc:.8f} LTC** but got **{amount_ltc:.8f} LTC**. Contact an admin.",
-                        COLOR_DANGER,
-                    ))
-                if guild:
-                    await bot.notify_admins(guild, msg)
-            continue
-
-        if amount_ltc == 0:
-            continue
-
-        # Valid payment — determine status
-        status_text: str
-        if confs == 0:
-            status_text = "🔍 Payment Detected — Awaiting Confirmations"
-        elif confs < REQUIRED_CONFIRMATIONS:
-            status_text = f"🔄 Awaiting Confirmations ({confs}/{REQUIRED_CONFIRMATIONS})"
-        else:
-            status_text = "✅ Payment Confirmed"
-
-        color = COLOR_SUCCESS if confs >= REQUIRED_CONFIRMATIONS else COLOR_WARNING
-
-        # ── Send a channel message the FIRST time payment is seen on-chain ───
-        # Use a local flag so that multiple items in the same poll never
-        # double-fire even if the DB write hasn't been read back yet.
-        already_notified = tx.get("payment_detected_notified", False) or _detected_this_poll
-        if not already_notified and channel:
-            mm_name = await bot.db.get_setting("mm_name") or "AutoMM"
-            star    = await _get_star_emoji(bot)
-            arr     = await _get_arrow_emoji(bot)
-            await channel.send(embed=make_embed(
-                title=f"{star} Pending Payment Detected {star}",
-                description=(
-                    f"{arr} A Pending Transaction Is Detected\n\n"
-                    f"{arr} **${tx['amount_usd']:,.2f}** ( **{amount_ltc:.8f} LTC** )"
-                ),
-                color=COLOR_PRIMARY,
-                footer=f"{mm_name} • Awaiting confirmation",
-                footer_icon_url=BADGE_IMG,
-                thumbnail_url=SPINNER_GIF,
-            ))
-            await bot.db.update_transaction(transaction_id, {"payment_detected_notified": True})
-            _detected_this_poll = True  # prevent duplicate within same poll cycle
-            log.info("Payment detected notification sent for %s (confs=%d)", transaction_id, confs)
-
-        # ── Update the deposit embed to show current status ───────────────────
-        dep_msg_id = tx.get("deposit_message_id")
-        if channel and dep_msg_id:
-            try:
-                mm_name_poll = await bot.db.get_setting("mm_name") or "AutoMM"
-                star_poll    = await _get_star_emoji(bot)
-                arr_poll     = await _get_arrow_emoji(bot)
-                dep_msg  = await channel.fetch_message(dep_msg_id)
-                conf_str = f"{confs}/{REQUIRED_CONFIRMATIONS}"
-                txid_str = f"`{txid}`" if txid else "_Pending_"
-                new_embed = make_embed(
-                    title=f"{star_poll} Waiting For Payment {star_poll}",
-                    description=(
-                        f"Payment Credentials are Given Below\n\n"
-                        f"{arr_poll} **Address** : `{address}`\n"
-                        f"{arr_poll} **Amount to pay** : {amount_ltc:.8f} LTC\n\n"
-                        f"**Status:** {status_text}\n"
-                        f"**TXID:** {txid_str}  |  **Confirmations:** {conf_str}"
-                    ),
-                    color=color,
-                    thumbnail_url=LTC_LOGO,
-                    footer=mm_name_poll,
-                    footer_icon_url=BADGE_IMG,
-                )
-                # Disable Copy Address button once payment is detected
-                updated_view = DepositView(bot, transaction_id, tx["sender_id"])
-                for item_btn in updated_view.children:
-                    if getattr(item_btn, "label", None) == "Copy Address":
-                        item_btn.disabled = True  # type: ignore[union-attr]
-                await dep_msg.edit(embed=new_embed, view=updated_view)
-            except (discord.NotFound, discord.Forbidden):
-                pass
-            except Exception as exc:
-                log.warning("Failed to update deposit embed: %s", exc)
-
-        await bot.db.update_transaction(transaction_id, {
-            "deposit_txid":  txid,
-            "confirmations": confs,
-        })
-
-        if confs >= REQUIRED_CONFIRMATIONS:
-            # Store the ACTUAL received amount so withdrawal uses it exactly —
-            # fee is deducted from this amount (subtract_fee_from_amount=True),
-            # meaning the bot never sends more than it received.
-            received_sat = int(round(amount_ltc * 1e8))
-            await bot.db.update_transaction(transaction_id, {
-                "deposit_confirmed":    True,
-                "stage":                Stage.RELEASE,
-                "received_amount_ltc":  amount_ltc,
-                "received_amount_sat":  received_sat,
-            })
-            log.info(
-                "Payment confirmed for %s: %.8f LTC (%d sat), TXID=%s",
-                transaction_id, amount_ltc, received_sat, txid,
-            )
-            if channel:
-                mm_name = await bot.db.get_setting("mm_name") or "AutoMM"
-                star    = await _get_star_emoji(bot)
-                arr     = await _get_arrow_emoji(bot)
-                dot     = await _get_dot_emoji(bot)
-                await channel.send(embed=make_embed(
-                    title=f"{star} Payment Received {star}",
-                    description=(
-                        f"{arr} The Transaction is now Confirmed\n"
-                        f"{arr} Refund or Release can be processed now\n\n"
-                        f"{dot} **${tx['amount_usd']:,.2f} USD** ( **{amount_ltc:.8f} LTC** )"
-                    ),
-                    color=COLOR_SUCCESS,
-                    footer=f"{mm_name} • Payment Confirmed",
-                    footer_icon_url=BADGE_IMG,
-                    thumbnail_url=CHECKMARK_IMG,
-                ))
-            refreshed = await bot.db.get_transaction(transaction_id)
-            if refreshed and channel:
-                await _start_release_stage(bot, channel, refreshed)
-            return True
-
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Stage 8: Delivery
-# ---------------------------------------------------------------------------
-
-async def _start_delivery_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    # Mark delivery as started in DB BEFORE sending, so a crash during send
-    # is still recoverable (we'd just re-send, which is harmless).
-    await bot.db.update_transaction(tx["transaction_id"], {"delivery_stage_started": True})
-    view = DeliveryView(bot, tx["transaction_id"])
-    await channel.send(
-        content=f"<@{tx['receiver_id']}>",
-        embed=make_embed(
-            title=f"📦 Product Delivery — `{tx['transaction_id']}`",
-            description=(
-                "**Receiver**, payment has been confirmed.\n"
-                "Please deliver the product/service to the Sender.\n\n"
-                "Press **Product Delivered** once you have delivered everything."
-            ),
-            color=COLOR_INFO,
-        ),
-        view=view,
-    )
-
-
-class DeliveryView(BaseView):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__(bot, transaction_id)
-
-        done_btn = discord.ui.Button(
-            label="Product Delivered",
-            style=discord.ButtonStyle.success,
-            emoji="✅",
-            custom_id=f"del_done_{transaction_id}",
-        )
-        done_btn.callback = self._on_delivered
-        self.add_item(done_btn)
-
-        admin_btn = discord.ui.Button(
-            label="Contact Admin",
-            style=discord.ButtonStyle.secondary,
-            emoji="🛡️",
-            custom_id=f"del_admin_{transaction_id}",
-        )
-        admin_btn.callback = self._on_admin
-        self.add_item(admin_btn)
-
-    async def _on_delivered(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.DELIVERY)
-        if tx is None:
-            return
-        if interaction.user.id != tx["receiver_id"]:
-            await interaction.response.send_message(
-                "❌ Only the Receiver may mark delivery.", ephemeral=True
-            )
-            return
-        await self.bot.db.update_transaction(self.transaction_id, {"stage": Stage.RELEASE})
-        self.disable_all()
-        await interaction.response.edit_message(
-            embed=make_embed(
-                "📦 Product Delivered",
-                "✅ Receiver marked the product as delivered.",
-                COLOR_SUCCESS,
-            ),
-            view=self,
-        )
-        await _start_release_stage(self.bot, interaction.channel, tx)
-
-    async def _on_admin(self, interaction: discord.Interaction) -> None:
-        tx = await self.get_tx()
-        if tx and not await self.require_participant(interaction, tx):
-            return
-        await interaction.response.send_message("🛡️ An admin has been notified.", ephemeral=False)
-        await self.bot.notify_admins(
-            interaction.guild,
-            f"📢 Admin requested in trade `{self.transaction_id}` by {interaction.user.mention} (delivery)",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Stage 9: Release / Dispute
-# ---------------------------------------------------------------------------
-
-async def _start_release_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    mm_name = await bot.db.get_setting("mm_name") or "AutoMM"
-    star    = await _get_star_emoji(bot)
-    arr     = await _get_arrow_emoji(bot)
-    dot     = await _get_dot_emoji(bot)
-    view = ReleaseView(bot, tx["transaction_id"])
-    await channel.send(
-        content=f"<@{tx['sender_id']}>",
-        embed=make_embed(
-            title=f"{star} Payment Received {star}",
-            description=(
-                f"{arr} The Transaction is now Confirmed\n"
-                f"{arr} Refund Or Release Can be Processed Now\n\n"
-                f"{dot} **${tx['amount_usd']:,.2f} USD** ( **{tx['amount_ltc']:.8f} LTC** )"
-            ),
-            color=COLOR_SUCCESS,
-            footer=f"{mm_name} • Payment Confirmed",
-            footer_icon_url=BADGE_IMG,
-            thumbnail_url=CHECKMARK_IMG,
-        ),
-        view=view,
-    )
-
-
-class RefundConfirmView(discord.ui.View):
-    """Ephemeral confirmation shown when a participant presses Refund."""
-
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__(timeout=60)
-        self.bot            = bot
-        self.transaction_id = transaction_id
-
-        confirm_btn = discord.ui.Button(
-            label="✅ Confirm Refund",
-            style=discord.ButtonStyle.success,
-        )
-        confirm_btn.callback = self._on_confirm
-        self.add_item(confirm_btn)
-
-        back_btn = discord.ui.Button(
-            label="↩️ Go Back",
-            style=discord.ButtonStyle.secondary,
-        )
-        back_btn.callback = self._on_back
-        self.add_item(back_btn)
-
-    def _disable_all(self) -> None:
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-
-    async def _on_confirm(self, interaction: discord.Interaction) -> None:
-        self._disable_all()
-        await interaction.response.edit_message(
-            content="✅ Refund confirmed. Cancelling trade and notifying admin…",
-            embed=None,
-            view=self,
-        )
-        await do_cancel(
-            self.bot, self.transaction_id, interaction.user,
-            "Refund requested by participant", channel=interaction.channel,
-            outcome="refunded",
-        )
-        await self.bot.notify_admins(
-            interaction.guild,
-            f"💰 Refund requested in trade `{self.transaction_id}` by {interaction.user.mention}. "
-            f"Please return the LTC to the Sender.",
-        )
-
-    async def _on_back(self, interaction: discord.Interaction) -> None:
-        self._disable_all()
-        await interaction.response.edit_message(content="↩️ Cancelled.", embed=None, view=self)
-
-
-class ReleaseView(BaseView):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__(bot, transaction_id)
-
-        release_btn = discord.ui.Button(
-            label="Release",
-            style=discord.ButtonStyle.success,
-            custom_id=f"rel_release_{transaction_id}",
-        )
-        release_btn.callback = self._on_release
-        self.add_item(release_btn)
-
-        refund_btn = discord.ui.Button(
-            label="Refund",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"rel_refund_{transaction_id}",
-        )
-        refund_btn.callback = self._on_refund
-        self.add_item(refund_btn)
-
-        dispute_btn = discord.ui.Button(
-            label="Raise Dispute",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"rel_dispute_{transaction_id}",
-        )
-        dispute_btn.callback = self._on_dispute
-        self.add_item(dispute_btn)
-
-    async def _on_release(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.RELEASE)
-        if tx is None:
-            return
-        if interaction.user.id != tx["sender_id"]:
-            await interaction.response.send_message(
-                "❌ Only the Sender may release funds.", ephemeral=True
-            )
-            return
-        if tx.get("release_confirmed"):
-            await interaction.response.send_message("❌ Funds already released.", ephemeral=True)
-            return
-        # Guard: prevent duplicate confirmation messages if Release is pressed twice
-        if tx.get("release_pending"):
-            await interaction.response.send_message(
-                "⏳ A release confirmation is already pending in this channel.", ephemeral=True
-            )
-            return
-
-        mm_name    = await self.bot.db.get_setting("mm_name") or "AutoMM"
-        star       = await _get_star_emoji(self.bot)
-        dot        = await _get_dot_emoji(self.bot)
-        payout_ltc = tx.get("received_amount_ltc") or tx["amount_ltc"]
-        guild_icon = (
-            interaction.guild.icon.url
-            if interaction.guild and interaction.guild.icon
-            else None
-        )
-
-        # Mark pending BEFORE sending so concurrent presses are rejected
-        await self.bot.db.update_transaction(self.transaction_id, {"release_pending": True})
-
-        view = ReleaseConfirmationView(self.bot, self.transaction_id, tx["sender_id"])
-        await interaction.response.defer()
-        try:
-            msg = await interaction.channel.send(
-                embed=make_embed(
-                    title=f"{star} Release Payment Confirmation {star}",
-                    description=(
-                        f"{dot} **Amount to Release**\n"
-                        f"{payout_ltc:.8f} LTC\n"
-                        f"≈ ${tx['amount_usd']:,.2f} USD\n\n"
-                        f"{dot} **Releasing To**\n"
-                        f"<@{tx['receiver_id']}>\n\n"
-                        f"{dot} **Warning**\n"
-                        f"This action cannot be undone.\nPlease confirm carefully."
-                    ),
-                    color=COLOR_SUCCESS,
-                    footer=f"{mm_name} • Confirm button will activate in 5 seconds",
-                    footer_icon_url=BADGE_IMG,
-                    thumbnail_url=guild_icon,
-                ),
-                view=view,
-            )
-        except Exception:
-            # Roll back pending flag if send fails so Sender can retry
-            await self.bot.db.update_transaction(self.transaction_id, {"release_pending": False})
-            raise
-        view.message = msg
-        view._enable_task = asyncio.create_task(view.enable_after_delay())
-
-    async def _on_refund(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.RELEASE)
-        if tx is None:
-            return
-        if not await self.require_participant(interaction, tx):
-            return
-        dot  = await _get_dot_emoji(self.bot)
-        view = RefundConfirmView(self.bot, self.transaction_id)
-        await interaction.response.send_message(
-            embed=make_embed(
-                "💰 Confirm Refund",
-                (
-                    f"Are you sure you want to cancel this trade and request a refund?\n\n"
-                    f"{dot} **Amount:** {tx['amount_ltc']:.8f} LTC (≈ ${tx['amount_usd']:,.2f} USD)\n\n"
-                    f"An admin will be notified to return the LTC to the Sender."
-                ),
-                COLOR_WARNING,
-            ),
-            view=view,
-            ephemeral=True,
-        )
-
-    async def _on_dispute(self, interaction: discord.Interaction) -> None:
-        tx = await self.require_stage(interaction, Stage.RELEASE)
-        if tx is None:
-            return
-        if not await self.require_participant(interaction, tx):
-            return
-        await self.bot.db.update_transaction(self.transaction_id, {"stage": Stage.DISPUTED})
-        self.disable_all()
-        await interaction.response.edit_message(
-            embed=make_embed(
-                "⚖️ Dispute Opened",
-                "A dispute has been opened. An admin will assist shortly.",
-                COLOR_DANGER,
-            ),
-            view=self,
-        )
-        await self.bot.notify_admins(
-            interaction.guild,
-            f"⚖️ Dispute opened in trade `{self.transaction_id}` by {interaction.user.mention}",
-        )
-        await self.bot.db.add_log("dispute_opened", {
-            "transaction_id": self.transaction_id,
-            "user_id": interaction.user.id,
-        })
-
-    async def _on_admin(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message("🛡️ Notifying admin...", ephemeral=True)
-        await self.bot.notify_admins(
-            interaction.guild,
-            f"📢 Admin requested in trade `{self.transaction_id}` by {interaction.user.mention} (release)",
-        )
-
-
-class ReleaseConfirmationView(discord.ui.View):
-    """Channel-posted confirmation for the Release flow with a 5-second timed button."""
-
-    def __init__(self, bot: "AutoMMBot", transaction_id: str, sender_id: int) -> None:
-        super().__init__(timeout=180)
-        self.bot            = bot
-        self.transaction_id = transaction_id
-        self.sender_id      = sender_id
-        self.message: Optional[discord.Message] = None
-        self._done          = False                  # set on confirm or cancel
-        self._enable_task: Optional[asyncio.Task]  = None  # set externally
-
-        self.confirm_btn = discord.ui.Button(
-            label="✅ Confirm Release",
-            style=discord.ButtonStyle.success,
-            disabled=True,                           # enabled after 5 s delay
-            custom_id=f"relconf_yes_{transaction_id}",
-        )
-        self.confirm_btn.callback = self._on_confirm
-        self.add_item(self.confirm_btn)
-
-        cancel_btn = discord.ui.Button(
-            label="❌ Cancel",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"relconf_no_{transaction_id}",
-        )
-        cancel_btn.callback = self._on_cancel
-        self.add_item(cancel_btn)
-
-    async def enable_after_delay(self) -> None:
-        await asyncio.sleep(5)
-        if self._done:          # cancelled or confirmed before timer fired — no-op
-            return
-        self.confirm_btn.disabled = False
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    def _finish(self) -> None:
-        """Mark done and cancel the pending enable-task if still running."""
-        self._done = True
-        if self._enable_task and not self._enable_task.done():
-            self._enable_task.cancel()
-
-    def _disable_all(self) -> None:
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-
-    async def _on_confirm(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.sender_id:
-            await interaction.response.send_message(
-                "❌ Only the Sender may confirm release.", ephemeral=True
-            )
-            return
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None or tx["stage"] != Stage.RELEASE:
-            await interaction.response.edit_message(content="❌ Stage changed.", view=None)
-            return
-        if tx.get("release_confirmed"):
-            await interaction.response.edit_message(content="❌ Already released.", view=None)
-            return
-        self._finish()
-        await self.bot.db.update_transaction(self.transaction_id, {
-            "stage": Stage.WITHDRAWAL, "release_confirmed": True, "release_pending": False,
-        })
-        self._disable_all()
-        await interaction.response.edit_message(view=self)
-        if interaction.channel:
-            await _start_withdrawal_stage(self.bot, interaction.channel, tx)
-
-    async def _on_cancel(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.sender_id:
-            await interaction.response.send_message(
-                "❌ Only the Sender may cancel.", ephemeral=True
-            )
-            return
-        self._finish()
-        # Clear pending flag so Sender can press Release again
-        await self.bot.db.update_transaction(self.transaction_id, {"release_pending": False})
-        self._disable_all()
-        await interaction.response.edit_message(view=self)
-
-
-# ---------------------------------------------------------------------------
-# Stage 10: Withdrawal
-# ---------------------------------------------------------------------------
-
-async def _start_withdrawal_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    view = WithdrawalInputView(bot, tx["transaction_id"], tx["receiver_id"])
-    await channel.send(
-        content=f"<@{tx['receiver_id']}>",
-        embed=make_embed(
-            title=f"💸 Withdrawal — `{tx['transaction_id']}`",
-            description=(
-                "**Receiver**, please enter your LTC address to receive payment.\n"
-                "Funds will be sent automatically."
-            ),
-            color=COLOR_INFO,
-        ),
-        view=view,
-    )
-
-
-class WithdrawalModal(discord.ui.Modal, title="Enter LTC Withdrawal Address"):
-    address = discord.ui.TextInput(
-        label="LTC Address",
-        placeholder="Your Litecoin address (starts with L, M, 3, or ltc1)",
-        required=True,
-        max_length=100,
-    )
-
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__()
-        self.bot            = bot
-        self.transaction_id = transaction_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        addr = self.address.value.strip()
-        if not AprionClient.validate_ltc_address(addr):
-            await interaction.response.send_message(
-                "❌ Invalid LTC address. Please check and try again.", ephemeral=True
-            )
-            return
-
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None or tx["stage"] != Stage.WITHDRAWAL:
-            await interaction.response.send_message("❌ Stage mismatch.", ephemeral=True)
-            return
-        if tx.get("withdrawal_txid"):
-            await interaction.response.send_message(
-                "❌ Withdrawal already processed.", ephemeral=True
-            )
-            return
-        if interaction.user.id != tx["receiver_id"]:
-            await interaction.response.send_message(
-                "❌ Only the Receiver may submit a withdrawal address.", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        # Record address immediately to prevent double-withdraw
-        await self.bot.db.update_transaction(self.transaction_id, {
-            "withdrawal_address": addr,
-            "stage": Stage.WITHDRAWAL,  # keep until TX confirmed
-        })
-
-        # Use the ACTUAL received amount (stored at confirmation time), not the
-        # quoted amount — fee is subtracted from it so the bot never overpays.
-        payout_ltc = tx.get("received_amount_ltc") or tx["amount_ltc"]
-        payout_sat = int(round(payout_ltc * 1e8))
-        log.info(
-            "Withdrawal for %s: payout=%.8f LTC (%d sat) to %s "
-            "(received=%.8f, quoted=%.8f)",
-            self.transaction_id, payout_ltc, payout_sat, addr,
-            tx.get("received_amount_ltc", 0), tx["amount_ltc"],
-        )
-
-        mm_name = await self.bot.db.get_setting("mm_name") or "AutoMM"
-        star    = await _get_star_emoji(self.bot)
-        arr     = await _get_arrow_emoji(self.bot)
-
-        # Show "Releasing Funds..." embed while the API call is in flight
-        await interaction.channel.send(embed=make_embed(
-            title=f"{star} Releasing Funds... {star}",
-            description=(
-                f"{arr} Sending **{payout_ltc:.8f} LTC** to:\n"
-                f"```\n{addr}\n```"
-            ),
-            color=COLOR_SUCCESS,
-            footer=mm_name,
-            footer_icon_url=BADGE_IMG,
-            thumbnail_url=SPINNER_GIF,
-        ))
-
-        try:
-            result = await self.bot.aprion.withdraw(addr, payout_ltc)
-        except Exception as exc:
-            log.error("Withdrawal failed for %s: %s", self.transaction_id, exc)
-            await interaction.followup.send(
-                embed=make_embed(
-                    "❌ Withdrawal Failed",
-                    f"`{exc}`\n\nPlease contact an admin.",
-                    COLOR_DANGER,
-                    fields=[
-                        ("Amount", f"{payout_ltc:.8f} LTC", True),
-                        ("Address", f"`{addr}`", False),
-                    ],
-                ),
-                ephemeral=True,
-            )
-            await self.bot.notify_admins(
-                interaction.guild,
-                f"❌ Withdrawal failed for `{self.transaction_id}`: {exc}",
-            )
-            return
-
-        withdrawal_txid = (
-            result.get("txid")
-            or result.get("id")
-            or result.get("tx_hash")
-            or "pending"
-        )
-
-        await self.bot.db.update_transaction(self.transaction_id, {
-            "withdrawal_txid": withdrawal_txid,
-            "stage":           Stage.COMPLETED,
-            "completed_at":    datetime.now(timezone.utc),
-        })
-
-        # Update user stats
-        for uid in (tx["sender_id"], tx["receiver_id"]):
-            await self.bot.db.increment_user(uid, {
-                "completed_deals":   1,
-                "total_volume_usd":  tx["amount_usd"],
-                "total_volume_ltc":  tx["amount_ltc"],
-            })
-
-        txid_link = (
-            f"[{withdrawal_txid}](https://blockchair.com/litecoin/transaction/{withdrawal_txid})"
-            if withdrawal_txid and withdrawal_txid != "pending"
-            else f"`{withdrawal_txid}`"
-        )
-        sent_view = discord.ui.View()
-        if withdrawal_txid and withdrawal_txid != "pending":
-            sent_view.add_item(discord.ui.Button(
-                label="View on Blockchair",
-                style=discord.ButtonStyle.link,
-                url=f"https://blockchair.com/litecoin/transaction/{withdrawal_txid}",
-                emoji="🔗",
-            ))
-        await interaction.channel.send(
-            embed=make_embed(
-                title=f"{star} Payment Sent {star}",
-                description=f"{arr} The Litecoin payment has been successfully sent.",
-                color=COLOR_SUCCESS,
-                footer=mm_name,
-                footer_icon_url=BADGE_IMG,
-                thumbnail_url=CHECKMARK_IMG,
-                fields=[
-                    ("Deal ID",        self.transaction_id,               False),
-                    ("To Address",     f"`{addr}`",                       False),
-                    ("Amount Sent",    f"**{payout_ltc:.8f} LTC**",       False),
-                    ("Transaction ID", txid_link,                         False),
-                ],
-            ),
-            view=sent_view,
-        )
-
-        await interaction.followup.send("✅ Withdrawal submitted!", ephemeral=True)
-
-        # Post completion announcement
-        await self.bot.post_completed_announcement(interaction.guild, tx)
-
-        # Feedback stage
-        refreshed = await self.bot.db.get_transaction(self.transaction_id)
-        if refreshed:
-            await _start_feedback_stage(self.bot, interaction.channel, refreshed)
-
-
-class WithdrawalInputView(discord.ui.View):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str, receiver_id: int) -> None:
-        super().__init__(timeout=None)
-        self.bot            = bot
-        self.transaction_id = transaction_id
-        self.receiver_id    = receiver_id
-
-        btn = discord.ui.Button(
-            label="Enter Withdrawal Address",
-            style=discord.ButtonStyle.primary,
-            emoji="💸",
-            custom_id=f"wd_enter_{transaction_id}",
-        )
-        btn.callback = self._on_enter
-        self.add_item(btn)
-
-    async def _on_enter(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.receiver_id:
-            await interaction.response.send_message(
-                "❌ Only the Receiver may submit a withdrawal address.", ephemeral=True
-            )
-            return
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None or tx["stage"] != Stage.WITHDRAWAL:
-            await interaction.response.send_message("❌ Stage mismatch.", ephemeral=True)
-            return
-        if tx.get("withdrawal_txid"):
-            await interaction.response.send_message(
-                "❌ Withdrawal already processed.", ephemeral=True
-            )
-            return
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[union-attr]
-        await interaction.response.send_modal(WithdrawalModal(self.bot, self.transaction_id))
-        await interaction.message.edit(view=self)
-
-
-# ---------------------------------------------------------------------------
-# Stage 11: Feedback
-# ---------------------------------------------------------------------------
-
-async def _start_feedback_stage(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    # Already both submitted — nothing to do
-    if tx.get("feedback_sent_sender") and tx.get("feedback_sent_receiver"):
-        return
-
-    sid = tx["sender_id"]
-    rid = tx["receiver_id"]
-    view = FeedbackView(bot, tx["transaction_id"], sid, rid, star_emoji="⭐")
-    await channel.send(
-        content=f"<@{sid}> <@{rid}>",
-        embed=make_embed(
-            title="⭐ Leave Feedback",
-            description=(
-                "The deal is complete! Both parties may now leave feedback.\n"
-                "Press **Submit Feedback** below to rate your experience."
-            ),
-            color=COLOR_INFO,
-        ),
-        view=view,
-    )
-
-
-class FeedbackModal(discord.ui.Modal, title="Leave Feedback"):
-    rating = discord.ui.TextInput(
-        label="Rating (1 – 5 stars)",
-        placeholder="Enter a number from 1 to 5",
-        min_length=1,
-        max_length=1,
-        required=True,
-    )
-    comment = discord.ui.TextInput(
-        label="Comment (optional)",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=500,
-        placeholder="Share your experience…",
-    )
-
-    def __init__(
-        self,
-        bot: "AutoMMBot",
-        transaction_id: str,
-        reviewer_id: int,
-        target_id: int,
-    ) -> None:
-        super().__init__()
-        self.bot            = bot
-        self.transaction_id = transaction_id
-        self.reviewer_id    = reviewer_id
-        self.target_id      = target_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Validate rating first
-        try:
-            rating_val = int(self.rating.value.strip())
-            if not 1 <= rating_val <= 5:
-                raise ValueError
-        except (TypeError, ValueError):
-            await interaction.response.send_message(
-                "❌ Rating must be a whole number from 1 to 5.", ephemeral=True
-            )
-            return
-
-        # Server-side double-submit guard (catches race: user opens two modals before first commits)
-        tx_check = await self.bot.db.get_transaction(self.transaction_id)
-        if tx_check:
-            chk_field = (
-                "feedback_sent_sender"
-                if self.reviewer_id == tx_check["sender_id"]
-                else "feedback_sent_receiver"
-            )
-            if tx_check.get(chk_field):
-                await interaction.response.send_message(
-                    "❌ You have already submitted feedback for this deal.", ephemeral=True
-                )
-                return
-
-        comment = self.comment.value.strip() or None
-        star_e  = "⭐"
-        stars   = star_e * rating_val
-
-        # Respond immediately (within Discord's 3-second window)
-        await interaction.response.send_message(
-            embed=make_embed(
-                "✅ Feedback Submitted",
-                f"Thank you! You gave **{stars} ({rating_val}/5)**.",
-                COLOR_SUCCESS,
-            ),
-            ephemeral=True,
-        )
-
-        # Persist feedback to DB (unique index on transaction_id+reviewer_id prevents duplicate inserts)
-        await self.bot.db.add_feedback({
-            "transaction_id": self.transaction_id,
-            "reviewer_id":    self.reviewer_id,
-            "target_id":      self.target_id,
-            "rating":         rating_val,
-            "comment":        comment,
-            "created_at":     datetime.now(timezone.utc),
-        })
-
-        # Update target user aggregate stats
-        user      = await self.bot.db.get_user(self.target_id)
-        new_count = user.get("feedback_count", 0) + 1
-        new_sum   = user.get("rating_sum",     0) + rating_val
-        await self.bot.db.update_user(self.target_id, {
-            "feedback_count": new_count,
-            "rating_sum":     new_sum,
-            "average_rating": round(new_sum / new_count, 2),
-        })
-
-        # Mark this user's feedback as submitted
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx:
-            field = (
-                "feedback_sent_sender"
-                if self.reviewer_id == tx["sender_id"]
-                else "feedback_sent_receiver"
-            )
-            await self.bot.db.update_transaction(self.transaction_id, {field: True})
-
-        # Post the formatted feedback embed to the feedback log channel
-        await self.bot.post_feedback_embed(
-            interaction, self.transaction_id, self.reviewer_id, rating_val, comment
-        )
-
-        # Check if both parties submitted → finalize the ticket
-        refreshed = await self.bot.db.get_transaction(self.transaction_id)
-        if (
-            refreshed
-            and refreshed.get("feedback_sent_sender")
-            and refreshed.get("feedback_sent_receiver")
-        ):
-            ch = interaction.guild.get_channel(refreshed["channel_id"])
-            if ch:
-                await _finalize_ticket(self.bot, ch, refreshed)
-
-
-class FeedbackView(discord.ui.View):
-    """
-    Single "Submit Feedback" button shared by both trade parties.
-    Each user can click once; pressing again shows an ephemeral "already submitted" message.
-    """
-
-    def __init__(
-        self,
-        bot: "AutoMMBot",
-        transaction_id: str,
-        sender_id: int,
-        receiver_id: int,
-        star_emoji: str = "⭐",
-    ) -> None:
-        super().__init__(timeout=None)
-        self.bot         = bot
-        self.sender_id   = sender_id
-        self.receiver_id = receiver_id
-
-        btn = discord.ui.Button(
-            label="Submit Feedback ⭐",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"feedback_btn_{transaction_id}",
-        )
-        btn.callback = self._on_submit
-        self.add_item(btn)
-
-    async def _on_submit(self, interaction: discord.Interaction) -> None:
-        uid = interaction.user.id
-        # Fetch fresh tx from DB (the view may be stale after a restart)
-        tx  = await self.bot.db.get_transaction_by_channel(interaction.channel_id)
-
-        if not tx:
-            await interaction.response.send_message("❌ Trade not found.", ephemeral=True)
-            return
-
-        if uid not in (tx["sender_id"], tx["receiver_id"]):
-            await interaction.response.send_message(
-                "❌ You are not part of this trade.", ephemeral=True
-            )
-            return
-
-        field = "feedback_sent_sender" if uid == tx["sender_id"] else "feedback_sent_receiver"
-        if tx.get(field):
-            await interaction.response.send_message(
-                "❌ You have already submitted feedback for this deal.", ephemeral=True
-            )
-            return
-
-        target_id = tx["receiver_id"] if uid == tx["sender_id"] else tx["sender_id"]
-        await interaction.response.send_modal(
-            FeedbackModal(self.bot, tx["transaction_id"], uid, target_id)
-        )
-
-
-# ---------------------------------------------------------------------------
-# Transcript — full-fidelity Discord-style HTML
-# ---------------------------------------------------------------------------
-
-TRANSCRIPT_CSS = """
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#313338;color:#dbdee1;font-family:'gg sans','Noto Sans','Helvetica Neue',Helvetica,Arial,sans-serif;font-size:16px;line-height:1.375}
-a{color:#00a8fc;text-decoration:none}a:hover{text-decoration:underline}
-
-/* ── preamble ── */
-.preamble{background:#2b2d31;padding:20px 20px 0}
-.preamble__guild{display:flex;align-items:center;gap:16px;padding-bottom:16px;border-bottom:1px solid #3f4147}
-.preamble__guild-icon{width:64px;height:64px;border-radius:50%;background:#5865f2;object-fit:cover;flex-shrink:0}
-.preamble__guild-name{color:#fff;font-size:18px;font-weight:700}
-.preamble__channel{display:flex;align-items:center;gap:6px;margin-top:4px}
-.preamble__channel-name{color:#dbdee1;font-size:15px;font-weight:600}
-.preamble__meta{color:#949ba4;font-size:13px;padding:10px 0 18px}
-.preamble__participants{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
-.preamble__participant{display:flex;align-items:center;gap:6px;background:#313338;border-radius:20px;padding:4px 10px 4px 4px}
-.preamble__participant-avatar{width:24px;height:24px;border-radius:50%;object-fit:cover;background:#5865f2}
-.preamble__participant-name{font-size:13px;color:#dbdee1}
-
-/* ── chatlog ── */
-.chatlog{padding:16px 20px}
-
-/* ── day separator ── */
-.chatlog__day-separator{display:flex;align-items:center;gap:12px;margin:16px 0}
-.chatlog__day-separator::before,.chatlog__day-separator::after{content:'';flex:1;height:1px;background:#3f4147}
-.chatlog__day-separator-text{color:#949ba4;font-size:12px;font-weight:600;white-space:nowrap}
-
-/* ── message group ── */
-.chatlog__message-group{display:flex;gap:0;padding:2px 8px 2px 0;border-radius:4px;position:relative}
-.chatlog__message-group:hover{background:rgba(4,4,5,.07)}
-
-/* avatar column */
-.chatlog__author-avatar-container{width:72px;flex-shrink:0;padding-top:2px;display:flex;justify-content:center}
-.chatlog__author-avatar{width:40px;height:40px;border-radius:50%;object-fit:cover;background:#5865f2;cursor:pointer}
-.chatlog__author-avatar-placeholder{width:40px;height:40px;flex-shrink:0}
-
-/* short timestamp on hover for continuations */
-.chatlog__short-time{position:absolute;left:0;width:72px;text-align:right;padding-right:8px;font-size:11px;color:transparent;white-space:nowrap;pointer-events:none;top:4px}
-.chatlog__message-group:hover .chatlog__short-time{color:#949ba4}
-
-/* messages column */
-.chatlog__messages{flex:1;min-width:0;padding:2px 0}
-
-/* header (author + timestamp) */
-.chatlog__header{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:2px}
-.chatlog__author{font-size:16px;font-weight:500;color:#fff;cursor:pointer;line-height:1.375}
-.chatlog__author:hover{text-decoration:underline}
-.chatlog__bot-tag{background:#5865f2;color:#fff;font-size:10px;font-weight:700;padding:1px 4px;border-radius:3px;letter-spacing:.3px;text-transform:uppercase;vertical-align:middle;margin-left:2px;line-height:1.6;display:inline-block}
-.chatlog__timestamp{font-size:12px;color:#949ba4}
-
-/* message content */
-.chatlog__content{color:#dbdee1;font-size:16px;white-space:pre-wrap;word-wrap:break-word;line-height:1.375}
-.chatlog__content strong{font-weight:700}
-.chatlog__content em{font-style:italic}
-.chatlog__content del{text-decoration:line-through}
-.chatlog__content u{text-decoration:underline}
-.inline-code{background:#2b2d31;border:1px solid #1e1f22;border-radius:3px;padding:0 4px;font-family:'Consolas','Andale Mono WT','Andale Mono','Lucida Console',monospace;font-size:.875em;color:#dbdee1}
-.pre{background:#2b2d31;border:1px solid #1e1f22;border-radius:4px;padding:8px 12px;margin:6px 0;overflow-x:auto;position:relative}
-.pre__content{display:block;font-family:'Consolas','Andale Mono WT','Andale Mono','Lucida Console',monospace;font-size:14px;line-height:1.5;white-space:pre;color:#dbdee1}
-.pre-lang{position:absolute;top:6px;right:10px;font-size:11px;color:#949ba4;text-transform:uppercase}
-.chatlog__content blockquote{border-left:4px solid #4e5058;padding-left:12px;margin:4px 0;color:#dbdee1}
-.mention{background:rgba(88,101,242,.3);color:#c9cdfb;border-radius:3px;padding:0 2px;font-weight:500;cursor:pointer}
-.mention:hover{background:rgba(88,101,242,.5);color:#fff}
-.spoiler{background:#202225;color:transparent;border-radius:3px;padding:0 2px;cursor:pointer}
-.spoiler:hover{color:#dbdee1;background:#313338}
-
-/* attachments */
-.chatlog__attachment{margin-top:8px}
-.chatlog__attachment-media{max-width:520px;max-height:350px;border-radius:3px;display:block;object-fit:contain;cursor:pointer}
-.chatlog__attachment-file{display:flex;align-items:center;gap:10px;background:#2b2d31;border:1px solid #1e1f22;border-radius:4px;padding:10px 12px;margin-top:6px;max-width:520px}
-.chatlog__attachment-icon{font-size:24px}
-.chatlog__attachment-filename{color:#00a8fc;font-size:14px;font-weight:500}
-.chatlog__attachment-filesize{color:#949ba4;font-size:12px}
-
-/* embeds */
-.chatlog__embed{display:flex;max-width:520px;margin-top:8px;border-radius:0 4px 4px 0;overflow:hidden}
-.chatlog__embed-color-pill{width:4px;flex-shrink:0}
-.chatlog__embed-content-container{background:#2b2d31;padding:12px 16px;flex:1;min-width:0;display:flex;gap:12px}
-.chatlog__embed-inner{flex:1;min-width:0}
-.chatlog__embed-author{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.chatlog__embed-author-icon{width:24px;height:24px;border-radius:50%;object-fit:cover}
-.chatlog__embed-author-name{font-size:14px;font-weight:600;color:#dbdee1}
-.chatlog__embed-title{font-size:16px;font-weight:600;color:#fff;margin-bottom:6px;word-wrap:break-word}
-.chatlog__embed-description{font-size:14px;color:#dbdee1;white-space:pre-wrap;word-wrap:break-word;margin-bottom:8px;line-height:1.375}
-.chatlog__embed-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
-.chatlog__embed-field--block{grid-column:1/-1}
-.chatlog__embed-field-name{font-size:14px;font-weight:600;color:#dbdee1;margin-bottom:2px}
-.chatlog__embed-field-value{font-size:14px;color:#dbdee1;white-space:pre-wrap;word-wrap:break-word;line-height:1.375}
-.chatlog__embed-image{max-width:400px;max-height:300px;border-radius:4px;margin-top:12px;display:block;object-fit:contain}
-.chatlog__embed-thumbnail{width:80px;height:80px;border-radius:4px;object-fit:cover;flex-shrink:0}
-.chatlog__embed-footer{display:flex;align-items:center;gap:8px;margin-top:10px}
-.chatlog__embed-footer-icon{width:20px;height:20px;border-radius:50%;object-fit:cover}
-.chatlog__embed-footer-text{font-size:12px;color:#949ba4}
-
-/* reactions */
-.chatlog__reactions{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
-.chatlog__reaction{display:flex;align-items:center;gap:4px;background:#2b2d31;border:1px solid #3f4147;border-radius:8px;padding:2px 6px;font-size:13px;cursor:default}
-.chatlog__reaction-count{color:#dbdee1;font-size:13px;font-weight:500}
-
-/* components (buttons) */
-.chatlog__components{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
-.chatlog__component-btn{display:inline-flex;align-items:center;gap:6px;padding:5px 16px;border-radius:4px;font-size:14px;font-weight:500;background:#4e5058;color:#dbdee1;cursor:default}
-.chatlog__component-btn--primary{background:#5865f2;color:#fff}
-.chatlog__component-btn--success{background:#248046;color:#fff}
-.chatlog__component-btn--danger{background:#da373c;color:#fff}
-
-/* system messages */
-.chatlog__system-message{display:flex;align-items:center;gap:10px;color:#949ba4;font-size:14px;padding:4px 0 4px 72px}
-
-/* postamble */
-.postamble{background:#2b2d31;padding:16px 20px;border-top:1px solid #3f4147;color:#949ba4;font-size:13px;text-align:center}
-"""
-
-
-# ── markdown renderer ───────────────────────────────────────────────────────
-
-_CODEBLOCK_RE = _re.compile(r'```(?:(\w+)\n?)?([\s\S]*?)```', _re.DOTALL)
-
-
-def _render_markdown(text: str, guild: Optional[discord.Guild] = None) -> str:
-    """Convert Discord markdown + mentions to safe HTML."""
-    phs: list[str] = []
-
-    def ph(html: str) -> str:
-        i = len(phs)
-        phs.append(html)
-        return f"\x00P{i}\x00"
-
-    # 1. Multi-line code blocks
-    def _cb(m: _re.Match) -> str:
-        lang = html_lib.escape(m.group(1) or "")
-        body = html_lib.escape((m.group(2) or "").strip("\n"))
-        label = f'<span class="pre-lang">{lang}</span>' if lang else ""
-        return ph(f'<pre class="pre">{label}<code class="pre__content">{body}</code></pre>')
-    text = _CODEBLOCK_RE.sub(_cb, text)
-
-    # 2. Inline code
-    def _ic(m: _re.Match) -> str:
-        return ph(f'<code class="inline-code">{html_lib.escape(m.group(1))}</code>')
-    text = _re.sub(r'`([^`\n]+?)`', _ic, text)
-
-    # 3. Mentions  <@id>  <#id>  <@&id>
-    def _mention(m: _re.Match) -> str:
-        uid, cid, rid = m.group(1), m.group(2), m.group(3)
-        if uid:
-            label = "user"
-            if guild:
-                member = guild.get_member(int(uid))
-                if member:
-                    label = html_lib.escape(member.display_name)
-            return ph(f'<span class="mention">@{label}</span>')
-        if cid:
-            label = "channel"
-            if guild:
-                ch = guild.get_channel(int(cid))
-                if ch:
-                    label = html_lib.escape(ch.name)
-            return ph(f'<span class="mention">#{label}</span>')
-        if rid:
-            label = "role"
-            if guild:
-                role = guild.get_role(int(rid))
-                if role:
-                    label = html_lib.escape(role.name)
-            return ph(f'<span class="mention">@{label}</span>')
-        return m.group(0)
-    text = _re.sub(r'<@!?(\d+)>|<#(\d+)>|<@&(\d+)>', _mention, text)
-
-    # 4. URLs
-    def _url_link(m: _re.Match) -> str:
-        u = html_lib.escape(m.group(0))
-        return ph(f'<a href="{u}" target="_blank" rel="noreferrer">{u}</a>')
-    text = _re.sub(r'https?://\S+', _url_link, text)
-
-    # 5. HTML-escape remaining text
-    text = html_lib.escape(text)
-
-    # 6. Block formatting  (after escape so < > are safe)
-    text = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text, flags=_re.DOTALL)
-    text = _re.sub(r'(?<!\*)\*([^*\n]+?)\*(?!\*)', r'<em>\1</em>', text)
-    text = _re.sub(r'(?<!_)_([^_\n]+?)_(?!_)', r'<em>\1</em>', text)
-    text = _re.sub(r'~~(.+?)~~', r'<del>\1</del>', text, flags=_re.DOTALL)
-    text = _re.sub(r'__(.+?)__', r'<u>\1</u>', text, flags=_re.DOTALL)
-    text = _re.sub(r'\|\|(.+?)\|\|', r'<span class="spoiler">\1</span>', text, flags=_re.DOTALL)
-    text = text.replace('@everyone', '<span class="mention">@everyone</span>')
-    text = text.replace('@here', '<span class="mention">@here</span>')
-
-    # 7. Blockquotes  (escape turned '>' → '&gt;')
-    out_lines: list[str] = []
-    bq_buf: list[str] = []
-    consume_all = False
-    for line in text.split('\n'):
-        if consume_all:
-            bq_buf.append(line)
-        elif line.startswith('&gt;&gt;&gt; '):
-            bq_buf.append(line[13:])
-            consume_all = True
-        elif line.startswith('&gt; '):
-            bq_buf.append(line[5:])
-        else:
-            if bq_buf:
-                out_lines.append(f'<blockquote>{"<br>".join(bq_buf)}</blockquote>')
-                bq_buf = []
-                consume_all = False
-            out_lines.append(line)
-    if bq_buf:
-        out_lines.append(f'<blockquote>{"<br>".join(bq_buf)}</blockquote>')
-    text = '\n'.join(out_lines)
-
-    # 8. Restore placeholders
-    for i, html in enumerate(phs):
-        text = text.replace(f'\x00P{i}\x00', html)
-
-    return text
-
-
-# ── timestamp helpers ───────────────────────────────────────────────────────
-
-def _discord_ts(dt: datetime) -> str:
-    """Format like Discord: 'Today at 2:30 PM'"""
-    now = datetime.now(timezone.utc)
-    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-    if aware.date() == now.date():
-        prefix = "Today"
-    elif (now.date() - aware.date()).days == 1:
-        prefix = "Yesterday"
-    else:
-        prefix = aware.strftime("%m/%d/%Y")
-    t = aware.strftime("%I:%M %p").lstrip("0") or "12:00 AM"
-    return f"{prefix} at {t}"
-
-
-def _date_label(dt: datetime) -> str:
-    now = datetime.now(timezone.utc)
-    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-    if aware.date() == now.date():
-        return "Today"
-    if (now.date() - aware.date()).days == 1:
-        return "Yesterday"
-    return aware.strftime("%B %d, %Y")
-
-
-# ── embed + component renderers ─────────────────────────────────────────────
-
-def _embed_color_hex(color: Optional[discord.Colour]) -> str:
-    return f"#{color.value:06x}" if color is not None else "#5865f2"
-
-
-_BTN_CLS = {
-    discord.ButtonStyle.primary:   "chatlog__component-btn--primary",
-    discord.ButtonStyle.success:   "chatlog__component-btn--success",
-    discord.ButtonStyle.danger:    "chatlog__component-btn--danger",
-    discord.ButtonStyle.secondary: "",
-    discord.ButtonStyle.link:      "",
-}
-
-
-def _render_embed_html(embed: discord.Embed, guild: Optional[discord.Guild] = None) -> str:
-    color = _embed_color_hex(embed.colour)
-    parts = [
-        f'<div class="chatlog__embed">',
-        f'<div class="chatlog__embed-color-pill" style="background:{color}"></div>',
-        '<div class="chatlog__embed-content-container">',
-        '<div class="chatlog__embed-inner">',
-    ]
-    # Author
-    if embed.author and embed.author.name:
-        icon = f'<img class="chatlog__embed-author-icon" src="{html_lib.escape(embed.author.icon_url or "")}" alt="">' if embed.author.icon_url else ""
-        name = html_lib.escape(embed.author.name)
-        if embed.author.url:
-            name = f'<a href="{html_lib.escape(embed.author.url)}" target="_blank" rel="noreferrer">{name}</a>'
-        parts.append(f'<div class="chatlog__embed-author">{icon}<span class="chatlog__embed-author-name">{name}</span></div>')
-    # Title
-    if embed.title:
-        title = html_lib.escape(str(embed.title))
-        if embed.url:
-            title = f'<a href="{html_lib.escape(str(embed.url))}" target="_blank" rel="noreferrer" style="color:#00a8fc">{title}</a>'
-        parts.append(f'<div class="chatlog__embed-title">{title}</div>')
-    # Description
-    if embed.description:
-        parts.append(f'<div class="chatlog__embed-description">{_render_markdown(str(embed.description), guild)}</div>')
-    # Fields
-    if embed.fields:
-        parts.append('<div class="chatlog__embed-fields">')
-        for field in embed.fields:
-            cls = "" if field.inline else " chatlog__embed-field--block"
-            parts.append(
-                f'<div class="chatlog__embed-field{cls}">'
-                f'<div class="chatlog__embed-field-name">{html_lib.escape(str(field.name))}</div>'
-                f'<div class="chatlog__embed-field-value">{_render_markdown(str(field.value), guild)}</div>'
-                f'</div>'
-            )
-        parts.append('</div>')
-    # Image
-    if embed.image and embed.image.url:
-        parts.append(f'<img class="chatlog__embed-image" src="{html_lib.escape(embed.image.url)}" alt="image">')
-    # Footer
-    if embed.footer and embed.footer.text:
-        ficon = f'<img class="chatlog__embed-footer-icon" src="{html_lib.escape(embed.footer.icon_url or "")}" alt="">' if embed.footer.icon_url else ""
-        parts.append(
-            f'<div class="chatlog__embed-footer">{ficon}'
-            f'<span class="chatlog__embed-footer-text">{html_lib.escape(str(embed.footer.text))}</span>'
-            f'</div>'
-        )
-    parts.append('</div>')  # embed-inner
-    # Thumbnail (sits beside the inner content)
-    if embed.thumbnail and embed.thumbnail.url:
-        parts.append(f'<img class="chatlog__embed-thumbnail" src="{html_lib.escape(embed.thumbnail.url)}" alt="thumbnail">')
-    parts.append('</div>')  # embed-content-container
-    parts.append('</div>')  # chatlog__embed
-    return "".join(parts)
-
-
-def _render_components_html(components: list) -> str:
-    if not components:
-        return ""
-    rows: list[str] = ['<div class="chatlog__components">']
-    for row in components:
-        for item in getattr(row, "children", []):
-            label = getattr(item, "label", None) or getattr(item, "placeholder", None) or "Button"
-            style = getattr(item, "style", None)
-            extra = _BTN_CLS.get(style, "")
-            emoji = getattr(item, "emoji", None)
-            emoji_str = f"{emoji} " if emoji else ""
-            url = getattr(item, "url", None)
-            if url:
-                rows.append(f'<a class="chatlog__component-btn" href="{html_lib.escape(url)}" target="_blank" rel="noreferrer">{emoji_str}{html_lib.escape(str(label))} ↗</a>')
-            else:
-                rows.append(f'<span class="chatlog__component-btn {extra}">{emoji_str}{html_lib.escape(str(label))}</span>')
-    rows.append('</div>')
-    return "".join(rows)
-
-
-# ── main transcript generator ────────────────────────────────────────────────
-
-async def generate_channel_transcript_html(
-    channel: discord.TextChannel,
-    transaction_id: str,
-    outcome: str = "completed",
-) -> bytes:
-    """Render full channel history into a self-contained Discord-style HTML transcript."""
-    guild = channel.guild
-    messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
-
-    # ── preamble ──
-    guild_icon = str(guild.icon.url) if guild.icon else ""
-    guild_name = html_lib.escape(guild.name)
-    ch_name    = html_lib.escape(channel.name)
-    export_ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    outcome_badge = {
-        "completed":      '<span style="color:#3ba55d">✅ Completed</span>',
-        "refunded":       '<span style="color:#ed4245">🔄 Refunded</span>',
-        "force_refunded": '<span style="color:#ed4245">🔄 Force Refunded</span>',
-        "cancelled":      '<span style="color:#ed4245">❌ Cancelled</span>',
-    }.get(outcome, html_lib.escape(outcome))
-
-    # Collect unique participants for preamble
-    seen_ids: set[int] = set()
-    participants: list[discord.abc.User] = []
-    for msg in messages:
-        if msg.author.id not in seen_ids and not msg.author.bot:
-            seen_ids.add(msg.author.id)
-            participants.append(msg.author)
-
-    participant_html = ""
-    for p in participants:
-        av = html_lib.escape(str(p.display_avatar.url)) if p.display_avatar else ""
-        participant_html += (
-            f'<div class="preamble__participant">'
-            f'<img class="preamble__participant-avatar" src="{av}" alt="">'
-            f'<span class="preamble__participant-name">{html_lib.escape(p.display_name)}</span>'
-            f'</div>'
-        )
-
-    body: list[str] = [
-        "<!DOCTYPE html><html lang='en'><head>",
-        "<meta charset='utf-8'>",
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-        f"<title>Transcript · {html_lib.escape(transaction_id)}</title>",
-        f"<style>{TRANSCRIPT_CSS}</style>",
-        "</head><body>",
-        '<div class="preamble">',
-        f'<div class="preamble__guild">',
-        f'<img class="preamble__guild-icon" src="{html_lib.escape(guild_icon)}" alt="">',
-        f'<div><div class="preamble__guild-name">{guild_name}</div>'
-        f'<div class="preamble__channel"><span style="color:#949ba4">#</span>'
-        f'<span class="preamble__channel-name">{ch_name}</span></div></div>',
-        f'</div>',
-        f'<div class="preamble__meta">',
-        f'Transaction <code style="background:#1e1f22;padding:1px 6px;border-radius:3px">'
-        f'{html_lib.escape(transaction_id)}</code> &nbsp;·&nbsp; {outcome_badge}'
-        f' &nbsp;·&nbsp; {len(messages)} messages &nbsp;·&nbsp; exported {export_ts}',
-        f'</div>',
-        f'<div class="preamble__participants">{participant_html}</div>',
-        '</div>',  # preamble
-        '<div class="chatlog">',
-    ]
-
-    # ── messages ──
-    last_author_id: Optional[int] = None
-    last_msg_time:  Optional[datetime] = None
-    last_date_label = ""
-
-    for msg in messages:
-        # Day separator
-        dl = _date_label(msg.created_at)
-        if dl != last_date_label:
-            body.append(
-                f'<div class="chatlog__day-separator">'
-                f'<span class="chatlog__day-separator-text">{dl}</span>'
-                f'</div>'
-            )
-            last_date_label = dl
-            last_author_id  = None  # force new group after separator
-
-        # System / join messages
-        if msg.type not in (discord.MessageType.default, discord.MessageType.reply) and not msg.content and not msg.embeds:
-            body.append(
-                f'<div class="chatlog__system-message">'
-                f'<span>⚙</span>'
-                f'<span>{html_lib.escape(msg.author.display_name)} — '
-                f'{html_lib.escape(str(msg.type).replace("MessageType.", ""))} · '
-                f'{_discord_ts(msg.created_at)}</span>'
-                f'</div>'
-            )
-            last_author_id = None
-            continue
-
-        # Group continuation: same author within 7 minutes
-        msg_time = msg.created_at.replace(tzinfo=timezone.utc) if msg.created_at.tzinfo is None else msg.created_at
-        is_continuation = (
-            last_author_id == msg.author.id
-            and last_msg_time is not None
-            and (msg_time - last_msg_time).total_seconds() < 420
-        )
-        last_author_id = msg.author.id
-        last_msg_time  = msg_time
-
-        av_url = html_lib.escape(str(msg.author.display_avatar.url)) if msg.author.display_avatar else ""
-        short_time = msg_time.strftime("%I:%M %p").lstrip("0") or "12:00 AM"
-
-        if is_continuation:
-            # No avatar or header — just content with hover timestamp
-            body.append(
-                '<div class="chatlog__message-group">'
-                f'<span class="chatlog__short-time">{short_time}</span>'
-                '<div class="chatlog__author-avatar-container">'
-                '<div class="chatlog__author-avatar-placeholder"></div>'
-                '</div>'
-                '<div class="chatlog__messages">'
-            )
-        else:
-            is_bot = msg.author.bot
-            bot_tag = ' <span class="chatlog__bot-tag">BOT</span>' if is_bot else ""
-            body.append(
-                '<div class="chatlog__message-group">'
-                '<div class="chatlog__author-avatar-container">'
-                f'<img class="chatlog__author-avatar" src="{av_url}" alt="">'
-                '</div>'
-                '<div class="chatlog__messages">'
-                '<div class="chatlog__header">'
-                f'<span class="chatlog__author">{html_lib.escape(msg.author.display_name)}</span>'
-                f'{bot_tag}'
-                f'<span class="chatlog__timestamp">{_discord_ts(msg.created_at)}</span>'
-                '</div>'
-            )
-
-        # Reply reference
-        if msg.reference and msg.reference.resolved and isinstance(msg.reference.resolved, discord.Message):
-            ref = msg.reference.resolved
-            ref_av = html_lib.escape(str(ref.author.display_avatar.url)) if ref.author.display_avatar else ""
-            ref_content = html_lib.escape((ref.content or "")[:80]) + ("…" if len(ref.content or "") > 80 else "")
-            body.append(
-                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:13px;color:#949ba4">'
-                f'<img src="{ref_av}" style="width:16px;height:16px;border-radius:50%;object-fit:cover" alt="">'
-                f'<span style="color:#dbdee1;font-weight:500">{html_lib.escape(ref.author.display_name)}</span>'
-                f'<span>{ref_content}</span>'
-                f'</div>'
-            )
-
-        # Content
-        if msg.content:
-            rendered = _render_markdown(msg.content, guild)
-            body.append(f'<div class="chatlog__content">{rendered}</div>')
-
-        # Attachments
-        for att in msg.attachments:
-            url   = html_lib.escape(att.url)
-            fname = html_lib.escape(att.filename)
-            ct    = (att.content_type or "").lower()
-            is_img = ct.startswith("image/") or att.filename.lower().endswith(
-                (".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif")
-            )
-            if is_img:
-                body.append(
-                    f'<div class="chatlog__attachment">'
-                    f'<a href="{url}" target="_blank" rel="noreferrer">'
-                    f'<img class="chatlog__attachment-media" src="{url}" alt="{fname}">'
-                    f'</a></div>'
-                )
-            else:
-                size_str = ""
-                if att.size:
-                    size_str = f'<span class="chatlog__attachment-filesize">{att.size // 1024} KB</span>'
-                body.append(
-                    f'<div class="chatlog__attachment">'
-                    f'<div class="chatlog__attachment-file">'
-                    f'<span class="chatlog__attachment-icon">📄</span>'
-                    f'<div><a class="chatlog__attachment-filename" href="{url}" target="_blank" rel="noreferrer">{fname}</a>'
-                    f'{size_str}</div>'
-                    f'</div></div>'
-                )
-
-        # Embeds
-        for embed in msg.embeds:
-            body.append(_render_embed_html(embed, guild))
-
-        # Components (buttons)
-        if msg.components:
-            body.append(_render_components_html(msg.components))
-
-        # Reactions
-        if msg.reactions:
-            body.append('<div class="chatlog__reactions">')
-            for rxn in msg.reactions:
-                emoji = str(rxn.emoji)
-                body.append(
-                    f'<div class="chatlog__reaction">'
-                    f'<span>{html_lib.escape(emoji)}</span>'
-                    f'<span class="chatlog__reaction-count">{rxn.count}</span>'
-                    f'</div>'
-                )
-            body.append('</div>')
-
-        body.append('</div></div>')  # chatlog__messages, chatlog__message-group
-
-    body.append('</div>')  # chatlog
-    body.append(
-        f'<div class="postamble">Generated by AutoMM Bot &nbsp;·&nbsp; {export_ts}</div>'
-    )
-    body.append('</body></html>')
-    return "".join(body).encode("utf-8")
-
-
-# ── delivery ─────────────────────────────────────────────────────────────────
-
-async def send_deal_transcript(
-    bot: "AutoMMBot",
-    channel: discord.TextChannel,
-    tx: dict,
-    outcome: str = "completed",
-) -> None:
-    """Generate the Discord-style HTML transcript and deliver it to both
-    participants (DM) and the configured log channel."""
-    transaction_id = tx["transaction_id"]
-    try:
-        transcript_bytes = await generate_channel_transcript_html(channel, transaction_id, outcome)
-    except Exception as exc:
-        log.error("Failed to generate transcript for %s: %s\n%s", transaction_id, exc, traceback.format_exc())
-        return
-
-    filename = f"transcript_{transaction_id}.html"
-
-    outcome_label = {
-        "completed":      "✅ Completed",
-        "refunded":       "🔄 Refunded",
-        "force_refunded": "🔄 Force Refunded",
-        "cancelled":      "❌ Cancelled",
-    }.get(outcome, outcome.title())
-
-    outcome_color = {
-        "completed":      COLOR_SUCCESS,
-        "refunded":       COLOR_WARNING,
-        "force_refunded": COLOR_WARNING,
-        "cancelled":      COLOR_DANGER,
-    }.get(outcome, COLOR_INFO)
-
-    summary_embed = make_embed(
-        title=f"📄 Trade Transcript — `{transaction_id}`",
+    embed = discord.Embed(
+        title="Purchase Summary",
         description=(
-            f"Outcome: **{outcome_label}**\n"
-            "A full transcript of this trade is attached — open in any browser for the full Discord-style view."
+            "**ℹ️  Order Breakdown**\n"
+            "• Item:\n"
+            f"```\n{cat['name']}\n```\n"
+            f"```\n{stats}\n```"
         ),
-        color=outcome_color,
-        fields=[
-            ("Sender",   f"<@{tx.get('sender_id')}>",   True),
-            ("Receiver", f"<@{tx.get('receiver_id')}>", True),
-            ("Amount",   f"{tx.get('amount_ltc', 0):.8f} LTC (${tx.get('amount_usd', 0):,.2f} USD)", False),
-        ],
+        color=0x5865F2,
     )
+    embed.set_thumbnail(url=INFO_IMAGE_URL)
+    return embed
 
-    guild = channel.guild
 
-    # DM both participants
-    for uid in {tx.get("sender_id"), tx.get("receiver_id")}:
-        if not uid:
-            continue
-        try:
-            user = guild.get_member(uid) or await bot.fetch_user(uid)
-            await user.send(
-                embed=summary_embed,
-                file=discord.File(fp=io.BytesIO(transcript_bytes), filename=filename),
-            )
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.info("Could not DM transcript to %s for %s: %s", uid, transaction_id, exc)
+async def get_toc(slug: str) -> str | None:
+    """Get ToC message for a category slug. Returns None if not set."""
+    doc = await col_toc.find_one({"slug": slug})
+    return doc["message"] if doc else None
 
-    # Log channel
-    log_channel_id = await bot.db.get_setting("log_channel_id") or (str(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None)
-    if log_channel_id:
-        log_ch = guild.get_channel(int(log_channel_id))
-        if log_ch:
-            try:
-                await log_ch.send(
-                    embed=summary_embed,
-                    file=discord.File(fp=io.BytesIO(transcript_bytes), filename=filename),
-                )
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Could not post transcript to log channel for %s: %s", transaction_id, exc)
+async def set_toc(slug: str, message: str):
+    """Set or update ToC for a category."""
+    await col_toc.update_one({"slug": slug}, {"$set": {"message": message}}, upsert=True)
 
-    await bot.db.update_transaction(transaction_id, {"transcript_sent": True})
+async def clear_toc(slug: str):
+    """Remove ToC for a category."""
+    await col_toc.delete_one({"slug": slug})
 
 
-# ---------------------------------------------------------------------------
-# Stage 13: Ticket finalization
-# ---------------------------------------------------------------------------
+async def get_setting(key: str) -> str:
+    doc = await col_settings.find_one({"key": key})
+    return doc["value"] if doc else SETTING_DEFAULTS.get(key, "")
 
-async def _finalize_ticket(
-    bot: "AutoMMBot", channel: discord.TextChannel, tx: dict
-) -> None:
-    await send_deal_transcript(bot, channel, tx, outcome="completed")
+async def set_setting(key: str, value: str):
+    await col_settings.update_one({"key": key}, {"$set": {"value": value}}, upsert=True)
 
-    view = TicketFinalView(bot, tx["transaction_id"])
-    await channel.send(
-        embed=make_embed(
-            title=f"🎉 Trade Completed — `{tx['transaction_id']}`",
-            description="This trade has been completed successfully. Thank you for using AutoMM!",
-            color=COLOR_SUCCESS,
-            fields=[
-                ("Sender",         f"<@{tx['sender_id']}>",             True),
-                ("Receiver",       f"<@{tx['receiver_id']}>",           True),
-                ("USD Amount",     f"${tx['amount_usd']:,.2f}",         True),
-                ("LTC Amount",     f"{tx['amount_ltc']:.8f} LTC",       True),
-                ("Transaction ID", f"`{tx['transaction_id']}`",         False),
-            ],
-        ),
-        view=view,
-    )
 
+def slugify(name: str) -> str:
+    """'Netflix 1 Month' → 'netflix-1-month'"""
+    return "-".join(name.lower().split())
 
-class TicketFinalView(discord.ui.View):
-    def __init__(self, bot: "AutoMMBot", transaction_id: str) -> None:
-        super().__init__(timeout=None)
-        self.bot            = bot
-        self.transaction_id = transaction_id
 
-        transcript_btn = discord.ui.Button(
-            label="Download Transcript",
-            style=discord.ButtonStyle.secondary,
-            emoji="📄",
-            custom_id=f"tf_transcript_{transaction_id}",
-        )
-        transcript_btn.callback = self._on_transcript
-        self.add_item(transcript_btn)
+# ── Category helpers ──────────────────────────────────────────────────────────
 
-        close_btn = discord.ui.Button(
-            label="Close Ticket",
-            style=discord.ButtonStyle.danger,
-            emoji="🔒",
-            custom_id=f"tf_close_{transaction_id}",
-        )
-        close_btn.callback = self._on_close
-        self.add_item(close_btn)
+async def db_get_categories() -> list:
+    return await col_cats.find({}, {"_id": 0}).to_list(length=200)
 
-    async def _on_transcript(self, interaction: discord.Interaction) -> None:
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        try:
-            transcript_bytes = await generate_channel_transcript_html(
-                interaction.channel, self.transaction_id, outcome="completed"
-            )
-        except Exception as exc:
-            log.error("Manual transcript generation failed for %s: %s", self.transaction_id, exc)
-            await interaction.followup.send("❌ Failed to generate transcript.", ephemeral=True)
-            return
-        file = discord.File(
-            fp=io.BytesIO(transcript_bytes),
-            filename=f"transcript_{self.transaction_id}.html",
-        )
-        await interaction.followup.send(
-            "📄 Your transcript (open in any browser for the full Discord-style view):",
-            file=file,
-            ephemeral=True,
-        )
+async def db_get_category(slug: str) -> dict | None:
+    return await col_cats.find_one({"slug": slug}, {"_id": 0})
 
-    async def _on_close(self, interaction: discord.Interaction) -> None:
-        tx = await self.bot.db.get_transaction(self.transaction_id)
-        uid = interaction.user.id
-        is_participant = tx and uid in (
-            tx.get("sender_id"), tx.get("receiver_id"), tx.get("initiator_id")
-        )
-        user_is_admin = is_admin(interaction.user)
-        if not is_participant and not user_is_admin:
-            await interaction.response.send_message(
-                "❌ Only participants or admins may close this ticket.", ephemeral=True
-            )
-            return
-        await interaction.response.defer()
-        await interaction.channel.send(
-            embed=make_embed(
-                "🔒 Closing Ticket",
-                "This channel will be deleted in 5 seconds.",
-                COLOR_DANGER,
-            )
-        )
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete(reason=f"Trade {self.transaction_id} closed")
-        except discord.Forbidden:
-            await interaction.channel.send("❌ Missing permissions to delete channel.")
+async def db_find_category(query: str) -> dict | None:
+    """Find by exact slug OR partial name match."""
+    cat = await db_get_category(slugify(query))
+    if cat:
+        return cat
+    all_cats = await db_get_categories()
+    return next((c for c in all_cats if query.lower() in c["name"].lower()), None)
 
-
-# ---------------------------------------------------------------------------
-# Main bot class
-# ---------------------------------------------------------------------------
-
-class AutoMMBot(commands.Bot):
-    def __init__(self) -> None:
-        intents = discord.Intents.default()
-        intents.members = True
-        intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
-
-        self.db         = Database(MONGODB_URI)
-        self.aprion     = AprionClient(APRIONE_ACCOUNT, APRIONE_TRANSFER_KEY)
-        self._monitoring: set[str] = set()   # TXs actively being polled for payment
-        self._recovering: set[str] = set()   # TXs being recovered into delivery stage
-
-    # --- Lifecycle ---
-
-    async def setup_hook(self) -> None:
-        await self.db.setup_indexes()
-        # Register persistent panel view so its button survives restarts
-        self.add_view(PanelView(self))
-        # Restore active transaction views
-        await self._restore_views()
-        # Start background monitor loop
-        self._monitor_loop.start()
-        # Sync slash commands
-        await self.tree.sync()
-        log.info("setup_hook complete. Commands synced.")
-
-    async def on_ready(self) -> None:
-        log.info("Logged in as %s (ID: %s)", self.user, self.user.id)
-        activity_type = await self.db.get_setting("status_type") or "watching"
-        activity_text = await self.db.get_setting("status_text") or "trades | /help"
-        atype = {
-            "watching":  discord.ActivityType.watching,
-            "playing":   discord.ActivityType.playing,
-            "listening": discord.ActivityType.listening,
-            "competing": discord.ActivityType.competing,
-        }.get(activity_type, discord.ActivityType.watching)
-        await self.change_presence(activity=discord.Activity(type=atype, name=activity_text))
-
-    async def close(self) -> None:
-        self._monitor_loop.cancel()
-        await self.aprion.close()
-        await super().close()
-
-    # --- Restore persistent views after restart ---
-
-    async def _restore_views(self) -> None:
-        active = await self.db.get_active_transactions()
-        log.info("Restoring views for %d active transactions.", len(active))
-        for tx in active:
-            tid   = tx["transaction_id"]
-            stage = tx["stage"]
-            sid   = tx.get("sender_id") or 0
-            rid   = tx.get("receiver_id") or 0
-            iid   = tx.get("initiator_id") or 0
-            oid   = tx.get("other_id") or 0
-
-            if stage == Stage.ROLE_SELECT:
-                self.add_view(RoleSelectView(self, tid, iid, oid))
-            elif stage == Stage.TOS:
-                sender_tos  = tx.get("sender_tos")
-                receiver_tos = tx.get("receiver_tos")
-                recv_accepted = tx.get("receiver_tos_accepted", False)
-                send_accepted = tx.get("sender_tos_accepted", False)
-                # Sender side
-                if sender_tos is None:
-                    self.add_view(TosPromptView(self, tid, sid, is_sender=True))
-                elif sender_tos != "__skip__" and not recv_accepted:
-                    self.add_view(TosAcceptView(self, tid, sid, rid, author_is_sender=True))
-                # Receiver side
-                if receiver_tos is None:
-                    self.add_view(TosPromptView(self, tid, rid, is_sender=False))
-                elif receiver_tos != "__skip__" and not send_accepted:
-                    self.add_view(TosAcceptView(self, tid, rid, sid, author_is_sender=False))
-            elif stage == Stage.AMOUNT:
-                self.add_view(AmountInputView(self, tid, sid))
-                self.add_view(AmountAgreeView(self, tid))
-            elif stage in (Stage.DEPOSIT, Stage.AWAITING_FUNDS):
-                self.add_view(DepositView(self, tid, sid))
-                if tid not in self._monitoring:
-                    # If deposit was already confirmed but stage update was lost,
-                    # jump straight to delivery recovery instead of re-polling.
-                    if tx.get("deposit_confirmed"):
-                        log.warning(
-                            "TX %s has deposit_confirmed=True but stage=%s — recovering delivery.",
-                            tid, stage,
-                        )
-                        self.loop.create_task(self._recover_delivery(tx))
-                    else:
-                        self.loop.create_task(self.monitor_payment(tid))
-            elif stage == Stage.DELIVERY:
-                self.add_view(DeliveryView(self, tid))
-                # If the bot crashed before the delivery message was sent, re-send it.
-                if not tx.get("delivery_stage_started"):
-                    log.warning(
-                        "TX %s is in DELIVERY stage but delivery_stage_started=False — recovering.",
-                        tid,
-                    )
-                    self.loop.create_task(self._recover_delivery(tx))
-            elif stage == Stage.RELEASE:
-                self.add_view(ReleaseView(self, tid))
-                # Any in-flight confirmation message is gone after restart;
-                # clear the guard so Sender can press Release again.
-                if tx.get("release_pending"):
-                    self.loop.create_task(
-                        self.db.update_transaction(tid, {"release_pending": False})
-                    )
-            elif stage == Stage.WITHDRAWAL:
-                self.add_view(WithdrawalInputView(self, tid, rid))
-            elif stage in (Stage.FEEDBACK, Stage.COMPLETED):
-                # One combined view per transaction; handles both parties internally
-                if not (tx.get("feedback_sent_sender") and tx.get("feedback_sent_receiver")):
-                    self.add_view(FeedbackView(self, tid, sid, rid, star_emoji="⭐"))
-                self.add_view(TicketFinalView(self, tid))
-        log.info("View restoration complete.")
-
-    # --- Payment monitoring ---
-
-    async def monitor_payment(self, transaction_id: str) -> None:
-        if transaction_id in self._monitoring:
-            return
-        self._monitoring.add(transaction_id)
-        log.info("Monitoring payments for %s", transaction_id)
-        try:
-            while True:
-                tx = await self.db.get_transaction(transaction_id)
-                if tx is None or tx["stage"] not in (Stage.DEPOSIT, Stage.AWAITING_FUNDS):
-                    break
-                done = await _poll_payment(self, transaction_id)
-                if done:
-                    break
-                await asyncio.sleep(POLL_INTERVAL)
-        except Exception as exc:
-            log.error(
-                "monitor_payment error for %s: %s\n%s",
-                transaction_id, exc, traceback.format_exc(),
-            )
-        finally:
-            self._monitoring.discard(transaction_id)
-            log.info("Stopped monitoring %s", transaction_id)
-
-    async def _recover_delivery(self, tx: dict) -> None:
-        """
-        Re-send the delivery stage message for a trade that is in DELIVERY stage
-        (or deposit_confirmed=True) but whose delivery message was never sent.
-        Waits until the bot is fully ready before attempting to fetch the channel.
-        """
-        await self.wait_until_ready()
-        tid = tx["transaction_id"]
-        try:
-            guild   = self.get_guild(tx["guild_id"])
-            channel = guild.get_channel(tx["channel_id"]) if guild else None
-            if not channel:
-                log.error("_recover_delivery: channel not found for TX %s", tid)
-                return
-
-            # Make sure stage is DELIVERY in DB (fix it if it was stuck at DEPOSIT)
-            if tx["stage"] != Stage.DELIVERY:
-                await self.db.update_transaction(tid, {
-                    "stage":             Stage.DELIVERY,
-                    "deposit_confirmed": True,
-                })
-                tx = await self.db.get_transaction(tid)
-
-            log.info("_recover_delivery: resending delivery message for TX %s", tid)
-
-            # Send a catch-up notice so the channel knows what happened
-            await channel.send(embed=make_embed(
-                title="⚠️ Trade Resumed After Restart",
-                description=(
-                    "The bot restarted after your payment was confirmed.\n"
-                    "Resuming the trade now — please check below."
-                ),
-                color=COLOR_WARNING,
-            ))
-            await _start_delivery_stage(self, channel, tx)
-
-        except Exception as exc:
-            log.error(
-                "_recover_delivery failed for TX %s: %s\n%s",
-                tid, exc, traceback.format_exc(),
-            )
-
-    @tasks.loop(seconds=POLL_INTERVAL * 2)
-    async def _monitor_loop(self) -> None:
-        """Safety net: catch transactions whose task died."""
-        try:
-            active = await self.db.get_active_transactions()
-            for tx in active:
-                tid   = tx["transaction_id"]
-                stage = tx["stage"]
-                # Restart payment monitoring if the poll task died
-                if (
-                    stage in (Stage.DEPOSIT, Stage.AWAITING_FUNDS)
-                    and tid not in self._monitoring
-                ):
-                    if tx.get("deposit_confirmed"):
-                        # Confirmed but stage not advanced — recover delivery
-                        self.loop.create_task(self._recover_delivery(tx))
-                    else:
-                        self.loop.create_task(self.monitor_payment(tid))
-                # Recover stuck DELIVERY trades where the message was never sent
-                elif (
-                    stage == Stage.DELIVERY
-                    and not tx.get("delivery_stage_started")
-                    and tid not in self._recovering
-                ):
-                    self._recovering.add(tid)
-                    self.loop.create_task(self._recover_delivery(tx))
-        except Exception as exc:
-            log.error("_monitor_loop error: %s", exc)
-
-    @_monitor_loop.before_loop
-    async def _before_monitor(self) -> None:
-        await self.wait_until_ready()
-
-    # --- Utility helpers ---
-
-    async def notify_admins(self, guild: discord.Guild, message: str) -> None:
-        ping = f"<@&{ADMIN_ROLE_ID}> " if ADMIN_ROLE_ID else ""
-        full_message = f"{ping}{message}"
-        allowed = discord.AllowedMentions(roles=True) if ADMIN_ROLE_ID else discord.AllowedMentions.none()
-        log_channel_id = await self.db.get_setting("log_channel_id") or (str(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None)
-        if log_channel_id:
-            ch = guild.get_channel(int(log_channel_id))
-            if ch:
-                try:
-                    await ch.send(full_message, allowed_mentions=allowed)
-                    return
-                except Exception:
-                    pass
-        if guild.system_channel:
-            try:
-                await guild.system_channel.send(full_message, allowed_mentions=allowed)
-            except Exception:
-                pass
-
-    async def notify_user_ticket_opened(
-        self, user: discord.abc.User, channel: discord.TextChannel, transaction_id: str, other: discord.abc.User
-    ) -> None:
-        """DM a user letting them know a trade ticket has been opened with them."""
-        try:
-            await user.send(
-                embed=make_embed(
-                    title="📂 A Trade Ticket Was Opened With You",
-                    description=(
-                        f"**{other.display_name}** opened an AutoMM trade with you in "
-                        f"**{channel.guild.name}**.\n\n"
-                        f"Head to {channel.mention} to get started."
-                    ),
-                    color=COLOR_INFO,
-                    fields=[("Transaction ID", f"`{transaction_id}`", False)],
-                )
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            log.info("Could not DM user %s about new ticket %s (DMs closed).", user.id, transaction_id)
-
-    async def post_log_embed(self, guild: discord.Guild, embed: discord.Embed) -> None:
-        log_channel_id = await self.db.get_setting("log_channel_id") or (str(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None)
-        if log_channel_id:
-            ch = guild.get_channel(int(log_channel_id))
-            if ch:
-                try:
-                    await ch.send(embed=embed)
-                except Exception:
-                    pass
-
-    async def post_completed_announcement(
-        self, guild: discord.Guild, tx: dict
-    ) -> None:
-        channel_id = await self.db.get_setting("completed_channel_id")
-        if not channel_id:
-            return
-        ch = guild.get_channel(int(channel_id))
-        if not ch:
-            return
-
-        mm_name         = await self.db.get_setting("mm_name") or "AutoMM"
-        star            = await _get_star_emoji(self)
-        arr             = await _get_arrow_emoji(self)
-        withdrawal_txid = tx.get("withdrawal_txid") or tx.get("deposit_txid") or ""
-        tid             = tx.get("transaction_id", "")
-        guild_icon      = guild.icon.url if guild.icon else None
-
-        embed = make_embed(
-            title=f"⭐️ Deal Completed ⭐️",
-            description=f"{arr} Deal **{tid}** has been successfully completed.",
-            color=COLOR_SUCCESS,
-            thumbnail_url=CHECKMARK_IMG,
-            footer=mm_name,
-            footer_icon_url=guild_icon,
-            fields=[
-                ("Amount (USD)", f"${tx['amount_usd']:,.2f}",    False),
-                ("Amount (LTC)", f"{tx['amount_ltc']:.8f} LTC",  False),
-                ("Buyer",        f"<@{tx['sender_id']}>",        False),
-                ("Seller",       f"<@{tx['receiver_id']}>",      False),
-            ],
-        )
-
-        view = discord.ui.View()
-        if withdrawal_txid and withdrawal_txid not in ("pending", ""):
-            view.add_item(discord.ui.Button(
-                label="View on Blockchair",
-                style=discord.ButtonStyle.link,
-                url=f"https://blockchair.com/litecoin/transaction/{withdrawal_txid}",
-                emoji="🔗",
-            ))
-
-        try:
-            await ch.send(embed=embed, view=view)
-        except Exception as exc:
-            log.warning("Failed to post completion announcement: %s", exc)
-
-    async def post_feedback_embed(
-        self,
-        interaction: discord.Interaction,
-        transaction_id: str,
-        reviewer_id: int,
-        rating: int,
-        comment: Optional[str],
-    ) -> None:
-        """Post a formatted feedback embed to the configured feedback channel."""
-        channel_id = await self.db.get_setting("feedback_channel_id")
-        if not channel_id:
-            return
-        ch = interaction.guild.get_channel(int(channel_id))
-        if not ch:
-            return
-
-        mm_name  = await self.db.get_setting("mm_name") or "AutoMM"
-        star_e   = "⭐"
-        reviewer = interaction.guild.get_member(reviewer_id)
-        stars    = star_e * rating
-        now      = datetime.now(timezone.utc)
-
-        embed = discord.Embed(
-            title="Deal Feedback",
-            description=f"An user has submitted their feedback for **{mm_name}!**",
-            color=COLOR_PRIMARY,
-            timestamp=now,
-        )
-
-        # Server icon as small author logo
-        guild_icon = interaction.guild.icon
-        if guild_icon:
-            embed.set_author(name=mm_name, icon_url=guild_icon.url)
-        else:
-            embed.set_author(name=mm_name)
-
-        # Reviewer's avatar as thumbnail (top-right corner)
-        if reviewer:
-            embed.set_thumbnail(url=reviewer.display_avatar.url)
-
-        embed.add_field(name="Rating", value=f"{stars} ({rating}/5)", inline=False)
-        embed.add_field(
-            name="User",
-            value=reviewer.mention if reviewer else f"<@{reviewer_id}>",
-            inline=False,
-        )
-        embed.add_field(
-            name="Submitted At",
-            value=discord.utils.format_dt(now, style="F"),
-            inline=False,
-        )
-        if comment:
-            embed.add_field(name="Comment", value=comment, inline=False)
-
-        # Footer with server icon
-        if guild_icon:
-            embed.set_footer(text="Thank you for your feedback!", icon_url=guild_icon.url)
-        else:
-            embed.set_footer(text="Thank you for your feedback!")
-
-        try:
-            await ch.send(embed=embed)
-        except Exception as exc:
-            log.warning("Failed to post feedback embed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Admin check decorator
-# ---------------------------------------------------------------------------
-
-def is_admin(member: discord.Member) -> bool:
-    """
-    Returns True if the member has admin access.
-    Admin access is granted when ANY of the following is true:
-      1. ADMIN_ROLE_ID env var is set and the member has that role.
-      2. The member has the server Administrator permission.
-    """
-    if ADMIN_ROLE_ID and any(r.id == ADMIN_ROLE_ID for r in member.roles):
-        return True
-    return member.guild_permissions.administrator
-
-
-def admin_only() -> app_commands.check:
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "❌ You don't have permission to use this command.", ephemeral=True
-            )
-            return False
-        return True
-    return app_commands.check(predicate)
-
-
-# ---------------------------------------------------------------------------
-# Slash commands
-# ---------------------------------------------------------------------------
-
-def register_commands(bot: AutoMMBot) -> None:
-    tree = bot.tree
-
-    # ── Panel ──────────────────────────────────────────────────────────────
-
-    @tree.command(name="panel", description="Send the AutoMM panel to this channel")
-    @admin_only()
-    async def cmd_panel(interaction: discord.Interaction) -> None:
-        guild_icon = (
-            interaction.guild.icon.url
-            if interaction.guild and interaction.guild.icon
-            else None
-        )
-        star = await _get_star_emoji(bot)
-        dot  = await _get_dot_emoji(bot)
-        embed = make_embed(
-            title=f"{star} AutoMM Service {star}",
-            description=(
-                "**Minimum Amount →** $0.10\n\n"
-                "**How to Start**\n"
-                f"{dot} Click **Start New Deal** and enter the **User ID** of the person you're dealing with *(not their username)*.\n"
-                f"{dot} Both parties must be **in this server** before creating a ticket.\n"
-                f"{dot} **Discuss and agree** on all terms before making any payment.\n\n"
-                "**Important**\n"
-                "\u00a0\u00a0Keep all deal-related chat inside your ticket.\n"
-                "\u00a0\u00a0The bot will **never DM you** — report any suspicious DMs to staff immediately.\n"
-                "\u00a0\u00a0We can only hold **LTC (Litecoin)**.\n"
-                "\u00a0\u00a0Always assign **Sender** and **Receiver** roles carefully."
-            ),
-            color=COLOR_PRIMARY,
-            timestamp=False,
-            thumbnail_url=guild_icon,
-        )
-        await interaction.channel.send(embed=embed, view=PanelView(bot))
-        await interaction.response.send_message("✅ Panel sent.", ephemeral=True)
-
-    # ── Configuration ──────────────────────────────────────────────────────
-
-    @tree.command(name="setmmrole", description="Set the role required to open MM trades (omit to remove restriction)")
-    @admin_only()
-    @app_commands.describe(role="Role that members must have to open a trade (leave empty to allow everyone)")
-    async def cmd_setmmrole(
-        interaction: discord.Interaction, role: Optional[discord.Role] = None
-    ) -> None:
-        if role:
-            await bot.db.set_setting("user_role_id", str(role.id))
-            await interaction.response.send_message(
-                f"✅ MM trades are now restricted to {role.mention}.", ephemeral=True
-            )
-        else:
-            await bot.db.set_setting("user_role_id", None)
-            await interaction.response.send_message(
-                "✅ MM trade restriction removed — any server member can open a trade.",
-                ephemeral=True,
-            )
-
-    @tree.command(name="setlogchannel", description="Set the channel for bot logs")
-    @admin_only()
-    @app_commands.describe(channel="The channel for logs")
-    async def cmd_setlog(
-        interaction: discord.Interaction, channel: discord.TextChannel
-    ) -> None:
-        await bot.db.set_setting("log_channel_id", str(channel.id))
-        await interaction.response.send_message(
-            f"✅ Log channel set to {channel.mention}.", ephemeral=True
-        )
-
-    @tree.command(name="setticketcategory", description="Set the category for trade ticket channels")
-    @admin_only()
-    @app_commands.describe(category="Category for ticket channels")
-    async def cmd_setcategory(
-        interaction: discord.Interaction, category: discord.CategoryChannel
-    ) -> None:
-        await bot.db.set_setting("ticket_category_id", str(category.id))
-        await interaction.response.send_message(
-            f"✅ Ticket category set to **{category.name}**.", ephemeral=True
-        )
-
-    @tree.command(name="setcompletedchannel", description="Set the channel for completed trade announcements")
-    @admin_only()
-    @app_commands.describe(channel="Announcement channel")
-    async def cmd_setcompleted(
-        interaction: discord.Interaction, channel: discord.TextChannel
-    ) -> None:
-        await bot.db.set_setting("completed_channel_id", str(channel.id))
-        await interaction.response.send_message(
-            f"✅ Completed announcements → {channel.mention}.", ephemeral=True
-        )
-
-    @tree.command(name="setcompletedmessage", description="Set the custom completion announcement message")
-    @admin_only()
-    @app_commands.describe(message="Custom message text")
-    async def cmd_setcompletedmsg(
-        interaction: discord.Interaction, message: str
-    ) -> None:
-        await bot.db.set_setting("completed_message", message)
-        await interaction.response.send_message("✅ Message updated.", ephemeral=True)
-
-    @tree.command(name="testcompletedmessage", description="Send a test completion announcement")
-    @admin_only()
-    async def cmd_testcompleted(interaction: discord.Interaction) -> None:
-        fake_tx = {
-            "transaction_id": "TEST0000",
-            "sender_id":      interaction.user.id,
-            "receiver_id":    interaction.user.id,
-            "amount_usd":     100.0,
-            "amount_ltc":     2.5,
-            "withdrawal_txid": "be859d9978893fd98328d7c658a634c5d3c936a5af6df9a447810751d7490f54",
-        }
-        await bot.post_completed_announcement(interaction.guild, fake_tx)
-        await interaction.response.send_message("✅ Test announcement sent.", ephemeral=True)
-
-    @tree.command(name="testfeedback", description="Send a test feedback embed to the feedback channel")
-    @admin_only()
-    async def cmd_testfeedback(interaction: discord.Interaction) -> None:
-        """Post a fake feedback embed so you can preview the feedback channel layout."""
-        channel_id = await bot.db.get_setting("feedback_channel_id")
-        if not channel_id:
-            await interaction.response.send_message(
-                "❌ No feedback channel set. Use `/setfeedbackchannel` first.", ephemeral=True
-            )
-            return
-
-        ch = interaction.guild.get_channel(int(channel_id))
-        if not ch:
-            await interaction.response.send_message(
-                "❌ Feedback channel not found. Set it again with `/setfeedbackchannel`.", ephemeral=True
-            )
-            return
-
-        mm_name    = await bot.db.get_setting("mm_name") or "AutoMM"
-        star_e     = "⭐"
-        reviewer   = interaction.user
-        rating     = 5
-        comment    = "Great service, very smooth and fast! Highly recommend."
-        stars      = star_e * rating
-        now        = datetime.now(timezone.utc)
-        guild_icon = interaction.guild.icon
-
-        embed = discord.Embed(
-            title="Deal Feedback",
-            description=f"An user has submitted their feedback for **{mm_name}!**",
-            color=COLOR_PRIMARY,
-            timestamp=now,
-        )
-        if guild_icon:
-            embed.set_author(name=mm_name, icon_url=guild_icon.url)
-        else:
-            embed.set_author(name=mm_name)
-
-        embed.set_thumbnail(url=reviewer.display_avatar.url)
-        embed.add_field(name="Rating",        value=f"{stars} ({rating}/5)",          inline=False)
-        embed.add_field(name="User",          value=reviewer.mention,                  inline=False)
-        embed.add_field(name="Submitted At",  value=discord.utils.format_dt(now, "F"), inline=False)
-        embed.add_field(name="Comment",       value=comment,                           inline=False)
-
-        if guild_icon:
-            embed.set_footer(text="Thank you for your feedback!", icon_url=guild_icon.url)
-        else:
-            embed.set_footer(text="Thank you for your feedback!")
-
-        await ch.send(embed=embed)
-        await interaction.response.send_message(
-            f"✅ Test feedback embed sent to {ch.mention}.", ephemeral=True
-        )
-
-    @tree.command(name="testembed", description="Preview every embed in the full AutoMM trade flow")
-    @admin_only()
-    async def cmd_testembed(interaction: discord.Interaction) -> None:
-        """Send every flow embed with fake data so you can review them all at once."""
-        await interaction.response.send_message("✅ Sending full embed flow preview…", ephemeral=True)
-
-        ch      = interaction.channel
-        mm_name = await bot.db.get_setting("mm_name") or "AutoMM"
-        star    = await _get_star_emoji(bot)
-        arr     = await _get_arrow_emoji(bot)
-        dot     = await _get_dot_emoji(bot)
-        me      = interaction.user.mention
-
-        # ── Fake trade data ────────────────────────────────────────────────
-        TID        = "TEST1234"
-        USD        = 150.00
-        LTC        = 2.12345678
-        PRICE      = 70.65
-        ADDR       = "LcNibySYh4brMPSXYqJvA5knMudqRAcs6E"
-        TXID       = "9dbc2f27f0bae5a35a4508074dcdbaf79daa590f702e900a1c7162057e0ed0d8"
-        guild_icon = (
-            interaction.guild.icon.url
-            if interaction.guild and interaction.guild.icon
-            else None
-        )
-
-        def _view(*labels_styles: tuple[str, discord.ButtonStyle]) -> discord.ui.View:
-            """Return a View with all buttons disabled (for display only)."""
-            v = discord.ui.View()
-            for label, style in labels_styles:
-                b = discord.ui.Button(label=label, style=style, disabled=True)
-                v.add_item(b)
-            return v
-
-        async def _step(n: int, title: str) -> None:
-            await ch.send(f"**— Step {n}: {title} —**")
-
-        # ── Step 1: Panel + Role Selection (combined) ──────────────────────
-        await _step(1, "Panel + Role Selection")
-        await ch.send(
-            embed=make_embed(
-                title=f"🔄 AutoMM Trade — `{TID}`",
-                description="Both participants must select their roles to continue.",
-                color=COLOR_PRIMARY,
-                fields=[
-                    ("Sender",         "_Not selected_", True),
-                    ("Receiver",       "_Not selected_", True),
-                    ("Transaction ID", f"`{TID}`",       False),
-                ],
-            ),
-            view=_view(
-                ("Sender 💸",   discord.ButtonStyle.primary),
-                ("Receiver 📦", discord.ButtonStyle.primary),
-                ("Cancel ❌",   discord.ButtonStyle.danger),
-            ),
-        )
-
-        # ── Step 2: Roles Selected + Both Confirmed (same embed) ─────────────
-        await _step(2, "Roles Selected — both press Confirm in same embed")
-        await ch.send(
-            embed=make_embed(
-                title=f"✅ Roles Selected — `{TID}`",
-                description=(
-                    "Both roles selected. "
-                    "Each participant must press **Confirm** to continue."
-                ),
-                color=COLOR_SUCCESS,
-                fields=[
-                    ("Sender Role",   me,          True),
-                    ("Receiver Role", me,          True),
-                    ("Transaction ID", f"`{TID}`", False),
-                ],
-            ),
-            view=_view(
-                ("Sender 💸",   discord.ButtonStyle.primary),
-                ("Receiver 📦", discord.ButtonStyle.secondary),
-                ("Confirm ✅",  discord.ButtonStyle.success),
-                ("Cancel ❌",   discord.ButtonStyle.danger),
-            ),
-        )
-
-        # ── Step 3: Amount Entry ────────────────────────────────────────────
-        await _step(3, "Amount Entry")
-        await ch.send(
-            embed=make_embed(
-                title="💵 Enter Trade Amount",
-                description="**Sender**, press the button below to enter the USD amount for this trade.",
-                color=COLOR_INFO,
-            ),
-            view=_view(("💵 Enter Amount", discord.ButtonStyle.primary)),
-        )
-
-        # ── Step 4: Amount Agreement ────────────────────────────────────────
-        await _step(4, f"{star} Deal Amount Confirmation {star}")
-        await ch.send(
-            embed=make_embed(
-                title=f"{star} Deal Amount Confirmation {star}",
-                description=(
-                    f"{arr} **Amount : ${USD:,.2f} USD**\n\n"
-                    f"{arr} Accept Or Reject the Deal"
-                ),
-                color=COLOR_SUCCESS,
-                thumbnail_url=guild_icon,
-                footer=mm_name,
-                footer_icon_url=BADGE_IMG,
-            ),
-            view=_view(
-                ("Accept", discord.ButtonStyle.success),
-                ("Reject", discord.ButtonStyle.danger),
-            ),
-        )
-
-        # ── Step 5: Waiting For Payment ─────────────────────────────────────
-        await _step(5, f"{star} Waiting For Payment {star}")
-        await ch.send(
-            embed=make_embed(
-                title=f"{star} Waiting For Payment {star}",
-                description=(
-                    f"Payment Credentials are Given Below\n\n"
-                    f"{arr} **Address** : `{ADDR}`\n"
-                    f"{arr} **Amount to pay** : {LTC:.8f} LTC\n\n"
-                    f"Your payment will be Detected Automatically"
-                ),
-                color=COLOR_PRIMARY,
-                thumbnail_url=LTC_LOGO,
-                footer=mm_name,
-                footer_icon_url=BADGE_IMG,
-            ),
-            view=_view(
-                ("Copy Address", discord.ButtonStyle.primary),
-                ("QR Code",      discord.ButtonStyle.secondary),
-                ("Cancel",       discord.ButtonStyle.danger),
-            ),
-        )
-
-        # ── Step 6: Pending Payment Detected ───────────────────────────────
-        await _step(6, f"{star} Pending Payment Detected {star}")
-        await ch.send(embed=make_embed(
-            title=f"{star} Pending Payment Detected {star}",
-            description=(
-                f"{arr} A Pending Transaction Is Detected\n\n"
-                f"{arr} **${USD:,.2f}** ( **{LTC:.8f} LTC** )"
-            ),
-            color=COLOR_PRIMARY,
-            footer=f"{mm_name} • Awaiting confirmation",
-            footer_icon_url=BADGE_IMG,
-            thumbnail_url=SPINNER_GIF,
-        ))
-
-        # ── Step 7: Payment Received — Release / Refund ─────────────────────
-        await _step(7, f"{star} Payment Received — Release / Refund {star}")
-        await ch.send(
-            embed=make_embed(
-                title=f"{star} Payment Received {star}",
-                description=(
-                    f"{arr} The Transaction is now Confirmed\n"
-                    f"{arr} Refund Or Release Can be Processed Now\n\n"
-                    f"{dot} **${USD:,.2f} USD** ( **{LTC:.8f} LTC** )"
-                ),
-                color=COLOR_SUCCESS,
-                footer=f"{mm_name} • Payment Confirmed",
-                footer_icon_url=BADGE_IMG,
-                thumbnail_url=CHECKMARK_IMG,
-            ),
-            view=_view(
-                ("Release",       discord.ButtonStyle.success),
-                ("Refund",        discord.ButtonStyle.danger),
-                ("Raise Dispute", discord.ButtonStyle.secondary),
-            ),
-        )
-
-        # ── Step 8: After Release → Release Payment Confirmation ────────────
-        await _step(8, f"{star} Release Payment Confirmation {star}  (after Release pressed)")
-        rel_conf_view = discord.ui.View()
-        rel_conf_view.add_item(discord.ui.Button(
-            label="✅ Confirm Release",
-            style=discord.ButtonStyle.success,
-            disabled=True,   # activates after 5 s in the real flow
-        ))
-        rel_conf_view.add_item(discord.ui.Button(
-            label="❌ Cancel",
-            style=discord.ButtonStyle.danger,
-            disabled=True,
-        ))
-        await ch.send(
-            embed=make_embed(
-                title=f"{star} Release Payment Confirmation {star}",
-                description=(
-                    f"{dot} **Amount to Release**\n"
-                    f"{LTC:.8f} LTC\n"
-                    f"≈ ${USD:,.2f} USD\n\n"
-                    f"{dot} **Releasing To**\n"
-                    f"{me}\n\n"
-                    f"{dot} **Warning**\n"
-                    f"This action cannot be undone.\nPlease confirm carefully."
-                ),
-                color=COLOR_SUCCESS,
-                footer=f"{mm_name} • Confirm button will activate in 5 seconds",
-                footer_icon_url=BADGE_IMG,
-                thumbnail_url=guild_icon,
-            ),
-            view=rel_conf_view,
-        )
-
-        # ── Step 15: After Refund → Dispute Opened (alternate path) ─────────
-        await _step(9, "⚖️ Dispute Opened  (after Refund pressed)")
-        await ch.send(embed=make_embed(
-            title="⚖️ Dispute Opened",
-            description="A dispute has been opened. An admin will assist shortly.",
-            color=COLOR_DANGER,
-            fields=[("Transaction ID", f"`{TID}`", False)],
-        ))
-
-        # ── Step 16: Releasing Funds ─────────────────────────────────────────
-        await _step(10, f"{star} Releasing Funds... {star}  (after Confirm Release)")
-        await ch.send(embed=make_embed(
-            title=f"{star} Releasing Funds... {star}",
-            description=(
-                f"{arr} Sending **{LTC:.8f} LTC** to:\n"
-                f"```\n{ADDR}\n```"
-            ),
-            color=COLOR_SUCCESS,
-            footer=mm_name,
-            footer_icon_url=BADGE_IMG,
-            thumbnail_url=SPINNER_GIF,
-        ))
-
-        # ── Step 17: Payment Sent ────────────────────────────────────────────
-        await _step(11, f"{star} Payment Sent {star}")
-        txid_link = f"[{TXID[:20]}…](https://blockchair.com/litecoin/transaction/{TXID})"
-        sent_view = discord.ui.View()
-        sent_view.add_item(discord.ui.Button(
-            label="View on Blockchair",
-            style=discord.ButtonStyle.link,
-            url=f"https://blockchair.com/litecoin/transaction/{TXID}",
-            emoji="🔗",
-        ))
-        await ch.send(
-            embed=make_embed(
-                title=f"{star} Payment Sent {star}",
-                description=f"{arr} The Litecoin payment has been successfully sent.",
-                color=COLOR_SUCCESS,
-                footer=mm_name,
-                footer_icon_url=BADGE_IMG,
-                thumbnail_url=CHECKMARK_IMG,
-                fields=[
-                    ("Deal ID",        TID,        False),
-                    ("To Address",     f"`{ADDR}`", False),
-                    ("Amount Sent",    f"**{LTC:.8f} LTC**", False),
-                    ("Transaction ID", txid_link,   False),
-                ],
-            ),
-            view=sent_view,
-        )
-
-        # ── Step 18: Leave Feedback ──────────────────────────────────────────
-        await _step(12, "Leave Feedback")
-        await ch.send(
-            embed=make_embed(
-                title="⭐ Leave Feedback",
-                description=(
-                    "The deal is complete! Both parties may now leave feedback.\n"
-                    "Press **Submit Feedback** below to rate your experience."
-                ),
-                color=COLOR_INFO,
-            ),
-            view=_view(("⭐ Submit Feedback", discord.ButtonStyle.primary)),
-        )
-
-        # ── Step 19: Trade Cancelled (alternate path) ─────────────────────
-        await _step(13, "Trade Cancelled (alternate path)")
-        await ch.send(embed=make_embed(
-            title="❌ Trade Cancelled",
-            description="**Reason:** Product condition rejected by Receiver",
-            color=COLOR_DANGER,
-            fields=[("Transaction ID", f"`{TID}`", False)],
-        ))
-
-    @tree.command(name="setfeedbackchannel", description="Set the channel where feedback embeds are posted")
-    @admin_only()
-    @app_commands.describe(channel="Feedback log channel")
-    async def cmd_setfeedbackchannel(
-        interaction: discord.Interaction, channel: discord.TextChannel
-    ) -> None:
-        await bot.db.set_setting("feedback_channel_id", str(channel.id))
-        await interaction.response.send_message(
-            f"✅ Feedback channel set to {channel.mention}.", ephemeral=True
-        )
-
-    @tree.command(name="setmmname", description="Set the middleman service display name (e.g. Frost Auto Middleman)")
-    @admin_only()
-    @app_commands.describe(name="Display name shown on embeds and announcements")
-    async def cmd_setmmname(
-        interaction: discord.Interaction, name: str
-    ) -> None:
-        await bot.db.set_setting("mm_name", name)
-
-        # ── Preview button ─────────────────────────────────────────────────
-        class _PreviewView(discord.ui.View):
-            def __init__(self) -> None:
-                super().__init__(timeout=120)
-
-            @discord.ui.button(label="🔍 Preview Deal Announcement", style=discord.ButtonStyle.secondary)
-            async def preview(self, btn_interaction: discord.Interaction, button: discord.ui.Button) -> None:
-                button.disabled = True
-                await btn_interaction.response.edit_message(view=self)
-                fake_tx = {
-                    "transaction_id":  "TEST1234",
-                    "sender_id":       btn_interaction.user.id,
-                    "receiver_id":     btn_interaction.user.id,
-                    "amount_usd":      150.0,
-                    "amount_ltc":      2.12345678,
-                    "withdrawal_txid": "9dbc2f27f0bae5a35a4508074dcdbaf79daa590f702e900a1c7162057e0ed0d8",
-                }
-                await bot.post_completed_announcement(btn_interaction.guild, fake_tx)
-
-        await interaction.response.send_message(
-            f"✅ MM name set to **{name}**.\nPress the button below to preview how the deal announcement looks.",
-            view=_PreviewView(),
-            ephemeral=True,
-        )
-
-    # ── Bot status ─────────────────────────────────────────────────────────
-
-    @tree.command(name="setstatus", description="Set the bot's activity status")
-    @admin_only()
-    @app_commands.describe(
-        type="Activity type",
-        text="Status text shown after the activity type",
-    )
-    @app_commands.choices(type=[
-        app_commands.Choice(name="Watching",   value="watching"),
-        app_commands.Choice(name="Playing",    value="playing"),
-        app_commands.Choice(name="Listening",  value="listening"),
-        app_commands.Choice(name="Competing",  value="competing"),
-    ])
-    async def cmd_setstatus(
-        interaction: discord.Interaction, type: str, text: str
-    ) -> None:
-        await bot.db.set_setting("status_type", type)
-        await bot.db.set_setting("status_text", text)
-        atype = {
-            "watching":  discord.ActivityType.watching,
-            "playing":   discord.ActivityType.playing,
-            "listening": discord.ActivityType.listening,
-            "competing": discord.ActivityType.competing,
-        }[type]
-        await bot.change_presence(activity=discord.Activity(type=atype, name=text))
-        await interaction.response.send_message(
-            f"✅ Status set to **{type.capitalize()} {text}**.", ephemeral=True
-        )
-
-    # ── Emoji customisation ────────────────────────────────────────────────
-
-    @tree.command(name="setstaremoji", description="Set the star emoji used in embed titles (default: 🌟)")
-    @admin_only()
-    @app_commands.describe(emoji="Emoji to use as the star (e.g. ✨ 💫 ⭐)")
-    async def cmd_setstaremoji(
-        interaction: discord.Interaction, emoji: str
-    ) -> None:
-        await bot.db.set_setting("star_emoji", emoji.strip())
-        await interaction.response.send_message(
-            f"✅ Star emoji set to **{emoji.strip()}**. Embeds will now use this instead of 🌟/⭐.",
-            ephemeral=True,
-        )
-
-    @tree.command(name="setarrowemoji", description="Set the arrow/prefix emoji used in embed descriptions (default: >>)")
-    @admin_only()
-    @app_commands.describe(emoji="Emoji to use as the arrow/prefix (e.g. ➤ ▸ 🔹)")
-    async def cmd_setarrowemoji(
-        interaction: discord.Interaction, emoji: str
-    ) -> None:
-        await bot.db.set_setting("arrow_emoji", emoji.strip())
-        await interaction.response.send_message(
-            f"✅ Arrow emoji set to **{emoji.strip()}**. Embeds will now use this instead of >>.",
-            ephemeral=True,
-        )
-
-    @tree.command(name="setemojidot", description="Set the bullet/dot emoji used as list pointers in embeds (default: •)")
-    @admin_only()
-    @app_commands.describe(emoji="Emoji to use as bullet points (e.g. ◆ 🔸 ➜)")
-    async def cmd_setemojidot(
-        interaction: discord.Interaction, emoji: str
-    ) -> None:
-        await bot.db.set_setting("dot_emoji", emoji.strip())
-        await interaction.response.send_message(
-            f"✅ Dot/bullet emoji set to **{emoji.strip()}**. Embeds will now use this instead of •.",
-            ephemeral=True,
-        )
-
-    # ── Transaction management ─────────────────────────────────────────────
-
-    @tree.command(name="viewtransaction", description="View a transaction's details")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID (8 characters)")
-    async def cmd_view(
-        interaction: discord.Interaction, transaction_id: str
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            embed=make_embed(
-                title=f"📋 Transaction `{tx['transaction_id']}`",
-                color=COLOR_INFO,
-                fields=[
-                    ("Stage",             tx["stage"],                               True),
-                    ("Sender",            f"<@{tx.get('sender_id') or 'N/A'}>",     True),
-                    ("Receiver",          f"<@{tx.get('receiver_id') or 'N/A'}>",   True),
-                    ("USD",               f"${tx.get('amount_usd') or 0:,.2f}",     True),
-                    ("LTC",               f"{tx.get('amount_ltc') or 0:.8f}",       True),
-                    ("Deposit Confirmed", str(tx.get("deposit_confirmed", False)),   True),
-                    ("Frozen",            str(tx.get("frozen", False)),              True),
-                    ("Deposit TXID",      tx.get("deposit_txid") or "N/A",          False),
-                    ("Withdrawal TXID",   tx.get("withdrawal_txid") or "N/A",       False),
-                    ("Deposit Address",   tx.get("deposit_address") or "N/A",       False),
-                    ("Created",           str(tx.get("created_at", ""))[:19],       False),
-                ],
-            ),
-            ephemeral=True,
-        )
-
-    @tree.command(name="forceconfirm", description="Force-advance a transaction past the current stage")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID")
-    async def cmd_forceconfirm(
-        interaction: discord.Interaction, transaction_id: str
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        stage = tx["stage"]
-        if stage == Stage.ROLE_SELECT:
-            await bot.db.update_transaction(transaction_id.upper(), {
-                "sender_confirmed": True, "receiver_confirmed": True
-            })
-        elif stage == Stage.TOS:
-            await bot.db.update_transaction(transaction_id.upper(), {
-                "sender_tos": "__skip__", "receiver_tos": "__skip__",
-            })
-            ch = interaction.guild.get_channel(tx["channel_id"])
-            if ch:
-                await _start_amount_stage(bot, ch, await bot.db.get_transaction(transaction_id.upper()))
-        elif stage == Stage.AMOUNT:
-            await bot.db.update_transaction(transaction_id.upper(), {
-                "sender_confirmed": True, "receiver_confirmed": True
-            })
-        elif stage in (Stage.DEPOSIT, Stage.AWAITING_FUNDS):
-            await bot.db.update_transaction(transaction_id.upper(), {
-                "deposit_confirmed": True, "stage": Stage.DELIVERY
-            })
-            ch = interaction.guild.get_channel(tx["channel_id"])
-            if ch:
-                await _start_delivery_stage(bot, ch, await bot.db.get_transaction(transaction_id.upper()))
-        else:
-            await interaction.response.send_message(
-                f"❌ Cannot force confirm at stage `{stage}`.", ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            f"✅ Force confirmed `{transaction_id.upper()}`.", ephemeral=True
-        )
-        await bot.db.add_log("admin_force_confirm", {
-            "transaction_id": transaction_id.upper(), "admin_id": interaction.user.id
-        })
-
-    @tree.command(name="forcerelease", description="Force release funds to the Receiver")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID")
-    async def cmd_forcerelease(
-        interaction: discord.Interaction, transaction_id: str
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        if tx.get("release_confirmed"):
-            await interaction.response.send_message("❌ Already released.", ephemeral=True)
-            return
-        await bot.db.update_transaction(transaction_id.upper(), {
-            "stage": Stage.WITHDRAWAL, "release_confirmed": True,
-        })
-        ch = interaction.guild.get_channel(tx["channel_id"])
-        if ch:
-            await _start_withdrawal_stage(bot, ch, tx)
-        await interaction.response.send_message(
-            f"✅ Funds force-released for `{transaction_id.upper()}`.", ephemeral=True
-        )
-        await bot.db.add_log("admin_force_release", {
-            "transaction_id": transaction_id.upper(), "admin_id": interaction.user.id
-        })
-
-    @tree.command(name="forcerefund", description="Force refund (cancel) a trade")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID", reason="Refund reason")
-    async def cmd_forcerefund(
-        interaction: discord.Interaction,
-        transaction_id: str,
-        reason: str = "Admin force refund",
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        await bot.db.update_transaction(transaction_id.upper(), {
-            "stage": Stage.CANCELLED, "cancelled_by": interaction.user.id,
-            "cancel_reason": reason, "cancelled_at": datetime.now(timezone.utc),
-        })
-        ch = interaction.guild.get_channel(tx["channel_id"])
-        if ch:
-            await ch.send(embed=make_embed(
-                "🔄 Trade Force Refunded",
-                f"An admin issued a force refund.\n**Reason:** {reason}",
-                COLOR_WARNING,
-            ))
-        await interaction.response.send_message(
-            f"✅ Force refunded `{transaction_id.upper()}`.", ephemeral=True
-        )
-        await bot.db.add_log("admin_force_refund", {
-            "transaction_id": transaction_id.upper(),
-            "admin_id": interaction.user.id, "reason": reason
-        })
-        # Send transcript
-        refreshed = await bot.db.get_transaction(transaction_id.upper())
-        if refreshed and ch:
-            await send_deal_transcript(bot, ch, refreshed, outcome="force_refunded")
-
-    @tree.command(name="canceltransaction", description="Cancel an active trade")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID", reason="Cancellation reason")
-    async def cmd_cancel(
-        interaction: discord.Interaction,
-        transaction_id: str,
-        reason: str = "Admin cancelled",
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        await bot.db.update_transaction(transaction_id.upper(), {
-            "stage": Stage.CANCELLED, "cancelled_by": interaction.user.id,
-            "cancel_reason": reason, "cancelled_at": datetime.now(timezone.utc),
-        })
-        ch = interaction.guild.get_channel(tx["channel_id"])
-        if ch:
-            await ch.send(embed=make_embed(
-                "❌ Trade Cancelled by Admin", f"**Reason:** {reason}", COLOR_DANGER,
-            ))
-        await interaction.response.send_message(
-            f"✅ Cancelled `{transaction_id.upper()}`.", ephemeral=True
-        )
-        # Send transcript
-        refreshed2 = await bot.db.get_transaction(transaction_id.upper())
-        if refreshed2 and ch:
-            await send_deal_transcript(bot, ch, refreshed2, outcome="cancelled")
-
-    @tree.command(name="freezetransaction", description="Freeze an active trade")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID")
-    async def cmd_freeze(
-        interaction: discord.Interaction, transaction_id: str
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        await bot.db.update_transaction(transaction_id.upper(), {"frozen": True})
-        ch = interaction.guild.get_channel(tx["channel_id"])
-        if ch:
-            await ch.send(embed=make_embed(
-                "🧊 Trade Frozen",
-                "This trade has been frozen by an admin. No actions may proceed until it is unfrozen.",
-                COLOR_WARNING,
-            ))
-        await interaction.response.send_message(
-            f"✅ Frozen `{transaction_id.upper()}`.", ephemeral=True
-        )
-
-    @tree.command(name="unfreezetransaction", description="Unfreeze a frozen trade")
-    @admin_only()
-    @app_commands.describe(transaction_id="Transaction ID")
-    async def cmd_unfreeze(
-        interaction: discord.Interaction, transaction_id: str
-    ) -> None:
-        tx = await bot.db.get_transaction(transaction_id.upper())
-        if tx is None:
-            await interaction.response.send_message("❌ Not found.", ephemeral=True)
-            return
-        await bot.db.update_transaction(transaction_id.upper(), {"frozen": False})
-        ch = interaction.guild.get_channel(tx["channel_id"])
-        if ch:
-            await ch.send(embed=make_embed(
-                "✅ Trade Unfrozen", "This trade may now continue.", COLOR_SUCCESS,
-            ))
-        await interaction.response.send_message(
-            f"✅ Unfrozen `{transaction_id.upper()}`.", ephemeral=True
-        )
-
-    # ── Blacklist ──────────────────────────────────────────────────────────
-
-    @tree.command(name="blacklist", description="Blacklist a user from AutoMM")
-    @admin_only()
-    @app_commands.describe(user="User to blacklist", reason="Reason")
-    async def cmd_blacklist(
-        interaction: discord.Interaction,
-        user: discord.Member,
-        reason: str = "No reason provided",
-    ) -> None:
-        await bot.db.blacklist_user(user.id, reason, interaction.user.id)
-        await interaction.response.send_message(
-            f"✅ {user.mention} blacklisted.\n**Reason:** {reason}", ephemeral=True
-        )
-        await bot.db.add_log("user_blacklisted", {
-            "user_id": user.id, "reason": reason, "admin_id": interaction.user.id
-        })
-
-    @tree.command(name="unblacklist", description="Remove a user from the blacklist")
-    @admin_only()
-    @app_commands.describe(user="User to unblacklist")
-    async def cmd_unblacklist(
-        interaction: discord.Interaction, user: discord.Member
-    ) -> None:
-        await bot.db.unblacklist_user(user.id)
-        await interaction.response.send_message(
-            f"✅ {user.mention} removed from blacklist.", ephemeral=True
-        )
-
-    # ── Statistics ─────────────────────────────────────────────────────────
-
-    @tree.command(name="stats", description="View global AutoMM statistics")
-    @admin_only()
-    async def cmd_stats(interaction: discord.Interaction) -> None:
-        s = await bot.db.get_global_stats()
-        await interaction.response.send_message(
-            embed=make_embed(
-                title="📊 AutoMM Statistics",
-                color=COLOR_INFO,
-                fields=[
-                    ("Total Trades",     str(s["total"]),                  True),
-                    ("Completed",        str(s["completed"]),               True),
-                    ("Cancelled",        str(s["cancelled"]),               True),
-                    ("Disputed",         str(s["disputed"]),                True),
-                    ("Total USD Volume", f"${s['total_usd']:,.2f}",         True),
-                    ("Total LTC Volume", f"{s['total_ltc']:.4f} LTC",       True),
-                ],
-            ),
-            ephemeral=True,
-        )
-
-    # ── User profile ───────────────────────────────────────────────────────
-
-    @tree.command(name="profile", description="View a user's trading profile")
-    @app_commands.describe(user="User to view (default: yourself)")
-    async def cmd_profile(
-        interaction: discord.Interaction,
-        user: Optional[discord.Member] = None,
-    ) -> None:
-        target = user or interaction.user
-        u      = await bot.db.get_user(target.id)
-        fbs    = await bot.db.get_user_feedback(target.id)
-        avg    = u.get("average_rating", 0)
-        star_e = "⭐"
-        recent = ""
-        for fb in fbs[:3]:
-            stars   = star_e * fb["rating"]
-            comment = fb.get("comment") or "_No comment_"
-            recent += f"{stars} — {comment}\n"
-        await interaction.response.send_message(
-            embed=make_embed(
-                title=f"👤 {target.display_name}",
-                color=COLOR_INFO,
-                fields=[
-                    ("Completed Deals",   str(u.get("completed_deals", 0)),          True),
-                    ("Total Volume USD",  f"${u.get('total_volume_usd', 0):,.2f}",   True),
-                    ("Total Volume LTC",  f"{u.get('total_volume_ltc', 0):.4f} LTC", True),
-                    ("Average Rating",    f"{star_e * round(avg)} ({avg}/5)",         True),
-                    ("Feedback Count",    str(u.get("feedback_count", 0)),            True),
-                    ("Recent Feedback",   recent or "_No feedback yet_",              False),
-                ],
-            ),
-            ephemeral=True,
-        )
-
-    # ── Clear old transaction history ──────────────────────────────────────
-
-    @tree.command(
-        name="clearhistory",
-        description="Delete transaction records (and their feedback/logs) that are 7+ days old",
-    )
-    @admin_only()
-    async def cmd_clearhistory(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        from datetime import timedelta
-        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-
-        # Only purge finished trades — never touch active ones
-        finished_stages = [Stage.COMPLETED, Stage.CANCELLED, Stage.DISPUTED]
-        cursor = bot.db.transactions.find({
-            "stage":      {"$in": finished_stages},
-            "created_at": {"$lt": cutoff},
-        })
-        old_txs: list[dict] = await cursor.to_list(length=None)
-
-        if not old_txs:
-            await interaction.followup.send(
-                "✅ No transaction records older than 7 days found.", ephemeral=True
-            )
-            return
-
-        old_ids = [tx["transaction_id"] for tx in old_txs]
-
-        # Delete transactions, feedback entries, and logs tied to those IDs
-        tx_result = await bot.db.transactions.delete_many({"transaction_id": {"$in": old_ids}})
-        fb_result = await bot.db.feedback.delete_many({"transaction_id": {"$in": old_ids}})
-        log_result = await bot.db.logs.delete_many({"data.transaction_id": {"$in": old_ids}})
-
-        await interaction.followup.send(
-            embed=make_embed(
-                "🗑️ History Cleared",
-                f"Removed records older than **7 days** (finished trades only).",
-                COLOR_SUCCESS,
-                fields=[
-                    ("Transactions Deleted", str(tx_result.deleted_count), True),
-                    ("Feedback Entries Deleted", str(fb_result.deleted_count), True),
-                    ("Log Entries Deleted", str(log_result.deleted_count), True),
-                ],
-            ),
-            ephemeral=True,
-        )
-        await bot.db.add_log("admin_clearhistory", {
-            "admin_id":    interaction.user.id,
-            "deleted_ids": old_ids,
-            "cutoff":      cutoff.isoformat(),
-        })
-
-    # ── Delete finished MM channels ────────────────────────────────────────
-
-    @tree.command(
-        name="deletemm",
-        description="Delete ticket channels for all completed or cancelled MMs (skips active trades)",
-    )
-    @admin_only()
-    async def cmd_deletemm(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        finished_stages = (Stage.COMPLETED, Stage.CANCELLED)
-        cursor = bot.db.transactions.find({"stage": {"$in": list(finished_stages)}})
-        finished: list[dict] = await cursor.to_list(length=None)
-
-        if not finished:
-            await interaction.followup.send(
-                "✅ No completed/cancelled MM channels to delete.", ephemeral=True
-            )
-            return
-
-        deleted = 0
-        skipped = 0
-        current_channel_tx = None  # track if the command channel is one to delete
-
-        for tx in finished:
-            ch_id = tx.get("channel_id")
-            if not ch_id:
-                skipped += 1
-                continue
-            ch = interaction.guild.get_channel(int(ch_id))
-            if ch is None:
-                skipped += 1
-                continue
-            # If this is the channel the command was run from, defer its
-            # deletion until AFTER we send the followup response — otherwise
-            # Discord returns 404 Unknown Message for the ephemeral reply.
-            if ch.id == interaction.channel_id:
-                current_channel_tx = tx
-                continue
-            try:
-                await ch.delete(reason=f"AutoMM /deletemm — trade {tx['transaction_id']} ({tx['stage']})")
-                deleted += 1
-            except discord.Forbidden:
-                log.warning("No permission to delete channel %s for trade %s", ch_id, tx["transaction_id"])
-                skipped += 1
-            except discord.HTTPException as exc:
-                log.warning("Failed to delete channel %s: %s", ch_id, exc)
-                skipped += 1
-
-        # Count the deferred channel as deleted (it will be removed momentarily)
-        if current_channel_tx:
-            deleted += 1
-
-        try:
-            await interaction.followup.send(
-                embed=make_embed(
-                    "🗑️ MM Channels Deleted",
-                    f"Finished processing **{len(finished)}** completed/cancelled trade(s).",
-                    COLOR_SUCCESS,
-                    fields=[
-                        ("Deleted", str(deleted), True),
-                        ("Already Gone / Skipped", str(skipped), True),
-                    ],
-                ),
-                ephemeral=True,
-            )
-        except Exception as exc:
-            log.warning("Could not send deletemm followup: %s", exc)
-
-        await bot.db.add_log("admin_deletemm", {
-            "admin_id": interaction.user.id,
-            "deleted": deleted,
-            "skipped": skipped,
-        })
-
-        # Now safely delete the command channel (after the reply was sent)
-        if current_channel_tx:
-            await asyncio.sleep(1)
-            try:
-                ch = interaction.guild.get_channel(int(current_channel_tx["channel_id"]))
-                if ch:
-                    await ch.delete(
-                        reason=f"AutoMM /deletemm — trade {current_channel_tx['transaction_id']} ({current_channel_tx['stage']})"
-                    )
-            except discord.HTTPException as exc:
-                log.warning("Failed to delete command channel after reply: %s", exc)
-
-    # ── Sweep account funds ────────────────────────────────────────────────
-
-    @tree.command(
-        name="sweepfunds",
-        description="Send all LTC in the Apirone account to a destination address (admin only)",
-    )
-    @admin_only()
-    @app_commands.describe(address="Destination LTC address (required)")
-    async def cmd_sweepfunds(
-        interaction: discord.Interaction,
-        address: str,
-    ) -> None:
-        dest = address.strip()
-        if not dest:
-            await interaction.response.send_message(
-                "❌ You must provide a destination LTC address.", ephemeral=True
-            )
-            return
-        if not AprionClient.validate_ltc_address(dest):
-            await interaction.response.send_message(
-                "❌ Invalid LTC destination address.", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        # Fetch balance so we can report it and pass exact satoshis to the transfer
-        balance_ltc: Optional[float] = None
-        balance_sat: Optional[int] = None
-        raw_info: dict = {}
-        try:
-            balance_ltc, raw_info = await bot.aprion.get_account_balance_ltc()
-            balance_sat = int(round(balance_ltc * 1e8)) if balance_ltc else None
-        except Exception as exc:
-            log.warning("Could not fetch balance before sweep: %s", exc)
-
-        # Warn but don't block — let Apirone decide if there's anything to send
-        if balance_ltc is not None and balance_ltc <= 0:
-            await interaction.followup.send(
-                embed=make_embed(
-                    "⚠️ Balance Appears Zero",
-                    (
-                        "The account balance reads **0 LTC**. The sweep will still be attempted "
-                        "in case the balance field is mis-parsed.\n\n"
-                        f"**Raw API response:**\n```json\n{str(raw_info)[:800]}\n```"
-                    ),
-                    COLOR_WARNING,
-                ),
-                ephemeral=True,
-            )
-
-        try:
-            result = await bot.aprion.sweep_all(dest, balance_sat=balance_sat)
-        except Exception as exc:
-            log.error("sweepfunds failed: %s", exc)
-            await interaction.followup.send(
-                embed=make_embed(
-                    "❌ Sweep Failed",
-                    (
-                        f"Error: `{exc}`\n\n"
-                        f"**Raw account info:**\n```json\n{str(raw_info)[:600]}\n```"
-                    ),
-                    COLOR_DANGER,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        txid = (
-            result.get("txid")
-            or result.get("id")
-            or result.get("tx_hash")
-            or str(result)[:100]
-        )
-
-        bal_str = f"{balance_ltc:.8f} LTC" if balance_ltc else "_unknown_"
-        await interaction.followup.send(
-            embed=make_embed(
-                "💸 Funds Swept",
-                f"All available funds have been sent to `{dest}`.",
-                COLOR_SUCCESS,
-                fields=[
-                    ("Amount Swept", bal_str, True),
-                    ("TXID", f"`{txid}`", False),
-                    ("Raw Result", f"```json\n{str(result)[:300]}\n```", False),
-                ],
-            ),
-            ephemeral=True,
-        )
-        await bot.db.add_log("admin_sweep_funds", {
-            "admin_id": interaction.user.id,
-            "destination": dest,
-            "balance_ltc": balance_ltc,
-            "txid": txid,
-        })
-        await bot.post_log_embed(interaction.guild, make_embed(
-            title="💸 Funds Swept by Admin",
-            color=COLOR_WARNING,
-            fields=[
-                ("Admin",       interaction.user.mention, True),
-                ("Destination", f"`{dest}`",              True),
-                ("Amount",      bal_str,                  True),
-                ("TXID",        f"`{txid}`",              False),
-            ],
-        ))
-
-    # ── Check Apirone account balance ──────────────────────────────────────
-
-    @tree.command(
-        name="checkfunds",
-        description="Show current LTC balance in the Apirone account (admin only)",
-    )
-    @admin_only()
-    async def cmd_checkfunds(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            balance_ltc, raw_info = await bot.aprion.get_account_balance_ltc()
-        except Exception as exc:
-            log.error("checkfunds failed: %s", exc)
-            await interaction.followup.send(
-                embed=make_embed(
-                    "❌ Balance Check Failed",
-                    f"`{exc}`",
-                    COLOR_DANGER,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        # Try to get live LTC price for USD equivalent
-        usd_val = ""
-        try:
-            price = await bot.aprion.get_ltc_price_usd()
-            usd_val = f"≈ **${balance_ltc * price:,.2f} USD** (@ ${price:,.2f}/LTC)"
-        except Exception:
-            usd_val = "_(price unavailable)_"
-
-        balance_sat = int(round(balance_ltc * 1e8))
-
-        await interaction.followup.send(
-            embed=make_embed(
-                "💰 Apirone Account Balance",
-                usd_val,
-                COLOR_SUCCESS if balance_ltc > 0 else COLOR_WARNING,
-                fields=[
-                    ("LTC Balance",  f"**{balance_ltc:.8f} LTC**", True),
-                    ("Satoshis",     f"{balance_sat:,} sat",        True),
-                    ("Account",      f"`{bot.aprion.account}`",     False),
-                    ("Raw API Info", f"```json\n{str(raw_info)[:500]}\n```", False),
-                ],
-            ),
-            ephemeral=True,
-        )
-        await bot.db.add_log("admin_checkfunds", {
-            "admin_id":    interaction.user.id,
-            "balance_ltc": balance_ltc,
-            "balance_sat": balance_sat,
-        })
-
-    # ── Help system ────────────────────────────────────────────────────────
-
-    def _help_embed_overview() -> discord.Embed:
-        return make_embed(
-            title="🏠 AutoMM — Overview",
-            description=(
-                "**AutoMM** is a fully automated **Litecoin middleman** service.\n"
-                "It securely holds funds while both parties complete a deal — "
-                "no trust required between Sender and Receiver.\n\n"
-                "**Minimum trade amount:** $0.10 USD\n"
-                "**Supported currency:** LTC (Litecoin) only\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**Quick Start**\n"
-                "1️⃣  Find the AutoMM panel in your server\n"
-                "2️⃣  Click **Start New Deal** and enter the other user's **Discord ID**\n"
-                "3️⃣  Both users confirm their roles and agree on an amount\n"
-                "4️⃣  Sender deposits LTC → bot confirms automatically\n"
-                "5️⃣  Receiver delivers — Sender releases funds\n"
-                "6️⃣  Both leave feedback — transcript sent to your DMs\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**Safety Rules**\n"
-                "⚠️  The bot will **never DM you first** — report suspicious DMs to staff\n"
-                "⚠️  Keep all deal chat **inside the ticket**\n"
-                "⚠️  Assign Sender/Receiver roles **carefully** before depositing\n\n"
-                "Use the dropdown below to explore other sections."
-            ),
-            color=COLOR_PRIMARY,
-        )
-
-    def _help_embed_flow() -> discord.Embed:
-        return make_embed(
-            title="🔄 How a Trade Works",
-            description=(
-                "A full trade goes through these stages automatically:\n\n"
-                "**Stage 1 — Open Ticket**\n"
-                "Click **Start New Deal** on the panel and enter the other user's Discord ID. "
-                "A private ticket channel is created for both of you.\n\n"
-                "**Stage 2 — Role Selection**\n"
-                "Both users choose their role:\n"
-                "• **Sender** — pays the LTC into escrow\n"
-                "• **Receiver** — delivers the product/service\n\n"
-                "**Stage 3 — Terms of Service**\n"
-                "Both users must accept the AutoMM ToS before proceeding.\n\n"
-                "**Stage 4 — Amount Agreement**\n"
-                "Both users agree on a USD amount (minimum $0.10). "
-                "The bot converts it to the exact LTC equivalent in real time.\n\n"
-                "**Stage 5 — Deposit**\n"
-                "The Sender receives a unique LTC deposit address. "
-                "The bot monitors the blockchain and auto-confirms when funds arrive.\n\n"
-                "**Stage 6 — Delivery**\n"
-                "The Receiver delivers their product or service. "
-                "Both parties discuss inside the ticket.\n\n"
-                "**Stage 7 — Release or Refund**\n"
-                "• Sender clicks **Release Funds** → Receiver gets paid ✅\n"
-                "• Sender clicks **Request Refund** → Admin returns LTC 🔄\n"
-                "• Either party can **Open a Dispute** for admin review ⚖️\n\n"
-                "**Stage 8 — Feedback**\n"
-                "Both users rate each other. A full **HTML transcript** is sent to your DMs "
-                "and the log channel automatically.\n\n"
-                "**Stage 9 — Close**\n"
-                "The ticket channel can be closed and deleted via the final buttons."
-            ),
-            color=COLOR_INFO,
-        )
-
-    def _help_embed_profile() -> discord.Embed:
-        return make_embed(
-            title="👤 Profile & Ratings",
-            description=(
-                "**`/profile [@user]`**\n"
-                "View any user's trading profile — or your own if no user is mentioned.\n\n"
-                "**What the profile shows:**\n"
-                "• Total trades completed\n"
-                "• Average star rating (1–5 ⭐)\n"
-                "• Total volume traded (LTC & USD)\n"
-                "• Feedback count\n"
-                "• Most recent feedback comments\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**Rating System**\n"
-                "After every completed trade, both parties rate each other on a scale of "
-                "**1 to 5 stars**. The average rating is displayed on the profile.\n\n"
-                "Feedback is submitted via the interactive buttons inside the ticket — "
-                "once both parties submit, the ticket finalises and transcripts are sent.\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**`/stats`**\n"
-                "View global AutoMM statistics — total trades, volume, active transactions, "
-                "and top traders. _(Admin only)_\n\n"
-                "**`/help`**\n"
-                "Opens this help menu."
-            ),
-            color=COLOR_SUCCESS,
-        )
-
-    def _help_embed_setup() -> discord.Embed:
-        return make_embed(
-            title="⚙️ Server Setup",
-            description=(
-                "Configure the bot for your server. All commands are **admin-only**.\n\n"
-                "**`/panel`**\n"
-                "Post the AutoMM panel embed with the **Start New Deal** button to the current channel.\n\n"
-                "**`/setmmrole [@role]`**\n"
-                "Restrict who can open trades to a specific role. Omit the role to allow everyone.\n\n"
-                "**`/setlogchannel [#channel]`**\n"
-                "Set the channel where all trade logs and transcripts are posted.\n\n"
-                "**`/setticketcategory [category]`**\n"
-                "Set the Discord category where trade ticket channels are created.\n\n"
-                "**`/setcompletedchannel [#channel]`**\n"
-                "Set the channel where completed trade announcements are posted.\n\n"
-                "**`/setcompletedmessage [text]`**\n"
-                "Set a custom message for completed trade announcements. "
-                "Supports placeholders: `{sender}`, `{receiver}`, `{amount}`, `{id}`.\n\n"
-                "**`/testcompletedmessage`**\n"
-                "Send a test completion announcement to verify your setup.\n\n"
-                "**`/setfeedbackchannel [#channel]`**\n"
-                "Set the channel where feedback embeds are posted after trades.\n\n"
-                "**`/testfeedback`**\n"
-                "Send a test feedback embed to verify the feedback channel.\n\n"
-                "**`/testembed`**\n"
-                "Preview every embed in the full AutoMM trade flow."
-            ),
-            color=COLOR_WARNING,
-        )
-
-    def _help_embed_admin() -> discord.Embed:
-        return make_embed(
-            title="🛡️ Trade Management",
-            description=(
-                "Commands to manage active and past trades. All are **admin-only**.\n\n"
-                "**`/viewtransaction [id]`**\n"
-                "View full details of any transaction by its ID — stage, participants, amounts, timestamps.\n\n"
-                "**`/forceconfirm [id]`**\n"
-                "Force-advance a stuck transaction past its current stage. "
-                "Use when a user cannot interact with the bot.\n\n"
-                "**`/forcerelease [id]`**\n"
-                "Force-release funds to the Receiver, bypassing the Sender's confirmation. "
-                "Use only after manually verifying delivery.\n\n"
-                "**`/forcerefund [id] [reason]`**\n"
-                "Force-cancel and refund a trade. Marks it cancelled and sends a transcript immediately.\n\n"
-                "**`/canceltransaction [id] [reason]`**\n"
-                "Cancel and close a trade. Sends transcript to participants.\n\n"
-                "**`/freezetransaction [id]`**\n"
-                "Freeze a trade — prevents any buttons from being interacted with. "
-                "Useful while investigating a dispute.\n\n"
-                "**`/unfreezetransaction [id]`**\n"
-                "Unfreeze a previously frozen trade.\n\n"
-                "**`/blacklist [@user]`**\n"
-                "Blacklist a user from opening AutoMM trades.\n\n"
-                "**`/unblacklist [@user]`**\n"
-                "Remove a user from the blacklist.\n\n"
-                "**`/stats`**\n"
-                "View global AutoMM statistics — total trades, volume, and active transactions."
-            ),
-            color=COLOR_DANGER,
-        )
-
-    def _help_embed_customization() -> discord.Embed:
-        return make_embed(
-            title="🎨 Customization",
-            description=(
-                "Personalise the look and feel of AutoMM. All are **admin-only**.\n\n"
-                "**`/setmmname [name]`**\n"
-                "Set the middleman service display name shown on embeds and announcements "
-                "_(e.g. `Frost Auto Middleman`)_.\n\n"
-                "**`/setstatus [type] [text]`**\n"
-                "Set the bot's Discord activity status.\n"
-                "Types: `playing`, `watching`, `listening`, `competing`.\n\n"
-                "**`/setstaremoji [emoji]`**\n"
-                "Set the star emoji used in embed titles. Default: 🌟\n\n"
-                "**`/setarrowemoji [emoji]`**\n"
-                "Set the arrow/prefix emoji used in embed descriptions. Default: `>>`\n\n"
-                "**`/setemojidot [emoji]`**\n"
-                "Set the bullet/dot emoji used as list pointers in embeds. Default: `•`\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**Tips**\n"
-                "• Custom emojis from your server work — use the full `<:name:id>` format\n"
-                "• Use `/testembed` after changes to preview the full flow\n"
-                "• Use `/testcompletedmessage` to verify announcement formatting"
-            ),
-            color=COLOR_PRIMARY,
-        )
-
-    def _help_embed_funds() -> discord.Embed:
-        return make_embed(
-            title="💰 Funds & Finance",
-            description=(
-                "Commands for managing the Apirone LTC account. All are **admin-only**.\n\n"
-                "**`/checkfunds`**\n"
-                "Show the current LTC balance in the Apirone escrow account, "
-                "including the live USD equivalent and raw API response.\n\n"
-                "**`/sweepfunds [ltc_address]`**\n"
-                "Send **all available LTC** in the Apirone account to a specified address.\n"
-                "⚠️ This action is **irreversible** — double-check the address before confirming.\n"
-                "The TXID is logged for your records.\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**How escrow works**\n"
-                "Every deposit goes to a unique address generated by Apirone. "
-                "Funds sit in the Apirone account until released — "
-                "the bot calls the Apirone transfer API to pay out the Receiver.\n\n"
-                "**Important:** Always keep a small buffer for network fees. "
-                "The bot accounts for fees automatically during payouts."
-            ),
-            color=COLOR_SUCCESS,
-        )
-
-    def _help_embed_maintenance() -> discord.Embed:
-        return make_embed(
-            title="🗑️ Maintenance",
-            description=(
-                "Housekeeping commands for keeping the server clean. All are **admin-only**.\n\n"
-                "**`/deletemm`**\n"
-                "Delete all ticket channels for **completed or cancelled** trades. "
-                "Active trades are never touched.\n"
-                "Useful for bulk-cleaning old MM channels after a period of activity.\n\n"
-                "**`/clearhistory`**\n"
-                "Delete transaction records (plus their feedback and log entries) "
-                "that are **7 or more days old** and in a finished state "
-                "(completed, cancelled, or disputed).\n"
-                "Active trades are never affected.\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "**When to use each**\n"
-                "• Run `/deletemm` periodically to keep your channel list tidy\n"
-                "• Run `/clearhistory` to prune old database records and keep things fast\n"
-                "• Always run `/viewtransaction` on a trade before deleting its channel "
-                "if you need the record"
-            ),
-            color=COLOR_WARNING,
-        )
-
-    _HELP_PAGE_BUILDERS = {
-        "overview":    _help_embed_overview,
-        "flow":        _help_embed_flow,
-        "profile":     _help_embed_profile,
-        "setup":       _help_embed_setup,
-        "admin":       _help_embed_admin,
-        "customization": _help_embed_customization,
-        "funds":       _help_embed_funds,
-        "maintenance": _help_embed_maintenance,
+async def db_create_category(name: str, price: float, description: str = "", instruction: str = "", group: str | None = None) -> dict:
+    cat = {
+        "slug":            slugify(name),
+        "name":            name,
+        "description":     description,
+        "instruction":     instruction,     # optional post-delivery instructions shown to buyer
+        "price_usd":       price,
+        "stock":           [],
+        "infinite_stock":  None,            # if set, this string is delivered instead of consuming stock
+        "custom_ltc_dest": None,            # if set, auto-transfer goes here instead of LTC_WALLET_ADDRESS
+        "min_quantity":    1,               # minimum purchase quantity
+        "group":           group,           # group slug this product belongs to, or None = Ungrouped
+        "createdAt":       datetime.utcnow().isoformat(),
     }
+    await col_cats.insert_one(cat)
+    return cat
 
-    class HelpSelect(discord.ui.Select):
-        def __init__(self, show_admin: bool) -> None:
-            options = [
-                discord.SelectOption(
-                    label="🏠 Overview",
-                    value="overview",
-                    description="What is AutoMM? Safety rules & quick start",
-                ),
-                discord.SelectOption(
-                    label="🔄 How a Trade Works",
-                    value="flow",
-                    description="Step-by-step guide through every trade stage",
-                ),
-                discord.SelectOption(
-                    label="👤 Profile & Ratings",
-                    value="profile",
-                    description="/profile, star ratings, feedback system",
-                ),
-            ]
-            if show_admin:
-                options += [
-                    discord.SelectOption(
-                        label="⚙️ Server Setup",
-                        value="setup",
-                        description="Channels, roles, categories, announcements",
-                    ),
-                    discord.SelectOption(
-                        label="🛡️ Trade Management",
-                        value="admin",
-                        description="Force actions, freeze, blacklist, view trades",
-                    ),
-                    discord.SelectOption(
-                        label="🎨 Customization",
-                        value="customization",
-                        description="Bot name, emojis, status, messages",
-                    ),
-                    discord.SelectOption(
-                        label="💰 Funds & Finance",
-                        value="funds",
-                        description="/checkfunds, /sweepfunds, Apirone escrow",
-                    ),
-                    discord.SelectOption(
-                        label="🗑️ Maintenance",
-                        value="maintenance",
-                        description="/deletemm, /clearhistory — clean up old data",
-                    ),
-                ]
-            super().__init__(
-                placeholder="📖 Select a help section…",
-                min_values=1,
-                max_values=1,
-                options=options,
-            )
+async def db_restock(slug: str, items: list[str]) -> int:
+    """Push new items; silently skip duplicates. Returns count added."""
+    cat = await col_cats.find_one({"slug": slug})
+    if not cat:
+        return 0
+    existing  = set(cat.get("stock", []))
+    new_items = [i for i in items if i not in existing]
+    if not new_items:
+        return 0
+    await col_cats.update_one({"slug": slug}, {"$push": {"stock": {"$each": new_items}}})
+    return len(new_items)
 
-        async def callback(self, interaction: discord.Interaction) -> None:
-            page = self.values[0]
-            builder = _HELP_PAGE_BUILDERS.get(page)
-            if builder is None:
-                await interaction.response.defer()
-                return
-            embed = builder()
-            await interaction.response.edit_message(embed=embed)
+async def db_consume_stock(slug: str, quantity: int) -> list | None:
+    """
+    Atomically pop `quantity` items from stock using findOneAndUpdate.
+    If the category has infinite_stock set, returns that string repeated
+    `quantity` times without modifying the DB.
+    Returns items list or None if insufficient stock.
+    """
+    cat = await col_cats.find_one({"slug": slug})
+    if not cat:
+        return None
 
-    class HelpView(discord.ui.View):
-        def __init__(self, show_admin: bool) -> None:
-            super().__init__(timeout=180)
-            self.add_item(HelpSelect(show_admin))
+    # Infinite stock mode — return the same item repeatedly, never consume
+    if cat.get("infinite_stock"):
+        return [cat["infinite_stock"]] * quantity
 
-    @tree.command(name="help", description="Show AutoMM commands, setup guides, and usage")
-    async def cmd_help(interaction: discord.Interaction) -> None:
-        show_admin = is_admin(interaction.user)
-        embed = _help_embed_overview()
-        await interaction.response.send_message(
-            embed=embed,
-            view=HelpView(show_admin),
-            ephemeral=True,
-        )
+    if len(cat.get("stock", [])) < quantity:
+        return None
+    items = cat["stock"][:quantity]
+    # Atomic: only update if those exact items are still there
+    result = await col_cats.find_one_and_update(
+        {"slug": slug, "stock.0": {"$exists": True}},
+        {"$pull": {"stock": {"$in": items}}},
+        return_document=True,
+    )
+    if result is None:
+        return None
+    # Verify the items were actually removed (not grabbed by someone else)
+    for item in items:
+        if item in result.get("stock", []):
+            return None  # Race condition — another buyer got them
+    return items
+
+async def db_delete_category(slug: str) -> bool:
+    r = await col_cats.delete_one({"slug": slug})
+    return r.deleted_count > 0
 
 
-# ---------------------------------------------------------------------------
-# Global error handler for slash commands
-# ---------------------------------------------------------------------------
+# ── Group helpers ─────────────────────────────────────────────────────────────
+# Groups are folders that products can be organised into (e.g. "Bot Src",
+# "Tools", "Accounts"). A product with group=None is shown as "Ungrouped".
 
-async def _on_app_command_error(
-    interaction: discord.Interaction, error: app_commands.AppCommandError
-) -> None:
-    if isinstance(error, app_commands.CheckFailure):
-        pass  # already handled in the predicate
+async def db_get_groups() -> list:
+    return await col_groups.find({}, {"_id": 0}).sort("name", 1).to_list(length=200)
+
+async def db_get_group(slug: str | None) -> dict | None:
+    if not slug:
+        return None
+    return await col_groups.find_one({"slug": slug}, {"_id": 0})
+
+async def db_find_group(query: str) -> dict | None:
+    """Find by exact slug OR partial name match."""
+    grp = await db_get_group(slugify(query))
+    if grp:
+        return grp
+    all_groups = await db_get_groups()
+    return next((g for g in all_groups if query.lower() in g["name"].lower()), None)
+
+async def db_create_group(name: str) -> dict | None:
+    """Returns the created group, or None if the slug already exists (race-safe)."""
+    grp = {
+        "slug":      slugify(name),
+        "name":      name,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+    try:
+        await col_groups.insert_one(grp)
+    except DuplicateKeyError:
+        return None
+    return grp
+
+async def db_rename_group(old_slug: str, new_name: str) -> str | None:
+    """Rename a group and keep every product's `group` field pointed at the new slug.
+    Returns the new slug, or None if that slug is already taken by another group (race-safe)."""
+    new_slug = slugify(new_name)
+    try:
+        result = await col_groups.update_one({"slug": old_slug}, {"$set": {"name": new_name, "slug": new_slug}})
+    except DuplicateKeyError:
+        return None
+    if result.matched_count == 0:
+        return None
+    await col_cats.update_many({"group": old_slug}, {"$set": {"group": new_slug}})
+    return new_slug
+
+async def db_delete_group(slug: str) -> bool:
+    r = await col_groups.delete_one({"slug": slug})
+    return r.deleted_count > 0
+
+async def db_categories_in_group(slug: str | None) -> list:
+    """Products in a specific group, or Ungrouped products if slug is None."""
+    if slug is None:
+        query = {"$or": [{"group": None}, {"group": {"$exists": False}}]}
     else:
-        log.error("App command error: %s", error, exc_info=True)
+        query = {"group": slug}
+    return await col_cats.find(query, {"_id": 0}).to_list(length=200)
+
+
+# ── Order helpers ─────────────────────────────────────────────────────────────
+
+def _gen_order_id() -> str:
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"ORD-{int(datetime.utcnow().timestamp())}-{suffix}"
+
+async def db_create_order(user_id, slug, cat_name, quantity, total_usd, ltc_amount, ltc_address) -> dict:
+    order = {
+        "orderId":        _gen_order_id(),
+        "userId":         user_id,
+        "categorySlug":   slug,
+        "categoryName":   cat_name,
+        "quantity":       quantity,
+        "totalUSD":       total_usd,
+        "ltcAmount":      ltc_amount,
+        "ltcAddress":     ltc_address,
+        "status":         "pending",
+        "txId":           None,
+        "createdAt":      datetime.utcnow().isoformat(),
+        "paidAt":         None,
+        "deliveredItems": [],
+    }
+    await col_orders.insert_one(order)
+    return order
+
+async def db_get_order(order_id: str) -> dict | None:
+    return await col_orders.find_one({"orderId": order_id}, {"_id": 0})
+
+async def db_update_order(order_id: str, updates: dict):
+    await col_orders.update_one({"orderId": order_id}, {"$set": updates})
+
+async def db_recent_orders(limit: int = 10) -> list:
+    return await col_orders.find({}, {"_id": 0}).sort("createdAt", -1).limit(limit).to_list(limit)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LTC UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def ltc_get_price() -> float:
+    """Live LTC/USD price from CoinGecko (free, no key needed)."""
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                return float((await r.json())["litecoin"]["usd"])
+    except Exception:
+        return 80.0     # fallback
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APIRONE — PER-ORDER LTC ADDRESS + BALANCE POLLING
+#  No KYC · Low fees · apirone.com
+#  Env vars: APIRONE_ACCOUNT, APIRONE_TRANSFER_KEY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+APIRONE_BASE = "https://apirone.com/api/v2"
+
+
+async def apirone_generate_address(order_id: str) -> str | None:
+    """
+    Generate a unique LTC deposit address for this order via Apirone.
+    Returns the address string or None on failure.
+    """
+    if LTC_DEV_MODE:
+        print(f"[apirone] DEV MODE — using static wallet address")
+        return LTC_WALLET_ADDRESS
+
+    if not APIRONE_ACCOUNT:
+        print("[apirone] ❌ APIRONE_ACCOUNT not set!")
+        return None
+
+    url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/addresses"
+    payload = {"currency": "ltc"}
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                text = await r.text()
+                print(f"[apirone] generate-address {r.status}: {text[:300]}")
+                if r.status != 200:
+                    print(f"[apirone] ❌ HTTP {r.status}")
+                    return None
+                data = await r.json()
+                addr = data.get("address", "")
+                if addr:
+                    print(f"[apirone] ✅ Address generated: {addr}")
+                    return addr
+                print(f"[apirone] ❌ No address in response: {data}")
+                return None
+    except Exception as e:
+        print(f"[apirone] ❌ Exception: {e}")
+        return None
+
+
+async def apirone_get_address_balance(address: str) -> dict:
+    """
+    Get current balance of an Apirone LTC address.
+    Returns dict with 'available' and 'total' in litoshis (1 LTC = 1e8 litoshis).
+    Returns empty dict on error.
+    """
+    if not APIRONE_ACCOUNT:
+        return {}
+    url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/addresses/{address}/balance"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    print(f"[apirone] balance HTTP {r.status}")
+                    return {}
+                data = await r.json()
+                # Address balance endpoint returns: {"account":..,"currency":"ltc","address":..,"available":N,"total":N}
+                return {
+                    "available": data.get("available", 0),
+                    "total":     data.get("total", 0),
+                }
+    except Exception as e:
+        print(f"[apirone] balance check error: {e}")
+        return {}
+
+
+async def apirone_get_address_history(address: str) -> list:
+    """
+    Get transaction history for an Apirone LTC address.
+    Returns list of tx dicts with 'amount', 'is_confirmed', 'txid'.
+    """
+    if not APIRONE_ACCOUNT:
+        return []
+    url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/addresses/{address}/history"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"limit": 5}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                return data.get("txs", [])
+    except Exception as e:
+        print(f"[apirone] history error: {e}")
+        return []
+
+
+async def _create_invoice_or_fail(order_id: str, ltc_amount: float, total_usd: float, channel, user) -> dict | None:
+    """
+    Generate a unique Apirone LTC address for this order.
+    If it fails, cancel the order and post an error in the channel.
+    Returns dict with pay_address and pay_amount, or None on failure.
+    """
+    addr = await apirone_generate_address(order_id)
+    if addr:
+        return {"pay_address": addr, "pay_amount": ltc_amount}
+
+    await db_update_order(order_id, {"status": "cancelled"})
+    ping = ""
+    if ADMIN_ROLE_ID and channel:
+        role = channel.guild.get_role(ADMIN_ROLE_ID)
+        ping = role.mention if role else ""
+    if channel:
+        await channel.send(
+            content=ping or None,
+            embed=discord.Embed(
+                title="❌  Payment System Error",
+                description=(
+                    "Could not generate a deposit address.\n\n"
+                    "**Possible causes:**\n"
+                    "• `APIRONE_ACCOUNT` env var not set or wrong\n"
+                    "• Apirone API temporarily down\n\n"
+                    "Check Railway logs for `[apirone]` lines."
+                ),
+                color=0xE74C3C,
+            )
+        )
+    return None
+
+
+async def process_payment_confirmed(order_id: str, actually_paid_litoshis: int = 0):
+    """
+    Called when Apirone confirms payment received for an order.
+    Delivers stock, sends DMs, closes channel, updates panel.
+    """
+    order = await db_get_order(order_id)
+    if not order:
+        print(f"[apirone] process_payment: order {order_id} not found")
+        return
+    if order["status"] == "delivered":
+        print(f"[apirone] process_payment: {order_id} already delivered")
+        return
+
+    # Consume stock
+    items = await db_consume_stock(order["categorySlug"], order["quantity"])
+    if not items:
+        await db_update_order(order_id, {"status": "error"})
+        await send_log(discord.Embed(
+            title="⚠️  Stock Depleted on Delivery",
+            description=f"Order `{order_id}` paid but no stock left for `{order['categoryName']}`.",
+            color=0xE74C3C,
+        ))
+        guild = bot.guilds[0] if bot.guilds else None
+        if guild:
+            ch_id = order.get("channelId")
+            ch    = guild.get_channel(int(ch_id)) if ch_id else None
+            user  = guild.get_member(int(order["userId"])) if guild else None
+            if ch:
+                ping = ""
+                if ADMIN_ROLE_ID:
+                    role = guild.get_role(ADMIN_ROLE_ID)
+                    ping = role.mention if role else ""
+                await ch.send(
+                    content=ping or None,
+                    embed=discord.Embed(
+                        title="⚠️  Payment Received — Stock Issue",
+                        description=(
+                            f"{user.mention if user else 'Buyer'} — Payment confirmed ✅ but stock is unavailable.\n\n"
+                            f"An admin will manually deliver your item or issue a refund.\n"
+                            f"**Order:** `{order_id}`"
+                        ),
+                        color=0xA855F7,
+                    )
+                )
+        return
+
+    actually_paid_ltc = actually_paid_litoshis / 1e8 if actually_paid_litoshis else order["ltcAmount"]
+
+    await db_update_order(order_id, {
+        "status":         "delivered",
+        "paidAt":         datetime.utcnow().isoformat(),
+        "deliveredItems": items,
+        "actuallyPaid":   actually_paid_ltc,
+    })
+
+    cat              = await db_get_category(order["categorySlug"])
+    instruction_text = f"\n\n📌 **Instructions:**\n{cat['instruction']}" if cat and cat.get("instruction") else ""
+    delivery_lines   = "\n".join(f"**{i+1}.** `{item}`" for i, item in enumerate(items))
+
+    guild = bot.guilds[0] if bot.guilds else None
+    if not guild:
+        return
+
+    try:
+        user = guild.get_member(int(order["userId"])) or await bot.fetch_user(int(order["userId"]))
+    except Exception:
+        user = None
+
+    channel_id = order.get("channelId")
+    channel    = guild.get_channel(int(channel_id)) if channel_id else None
+
+    # ── Channel: delivery confirmation + .ordercomplete message ──────────────
+    addr      = order.get("ltcAddress", "")
+    addr_url  = f"https://blockchair.com/litecoin/address/{addr}" if addr else ""
+    delivery_embed = discord.Embed(
+        title="✅  Order Delivered",
+        description=(
+            f"{user.mention if user else 'Buyer'} — Payment confirmed. Your items have been sent to your DMs."
+            + (f"\n\n🔗 [View on Blockchair]({addr_url})" if addr_url else "")
+        ),
+        color=0x7B2FBE,
+    )
+    delivery_embed.set_footer(text=f"Order: {order_id}")
+    if channel:
+        await channel.send(embed=delivery_embed)
+        # Send .ordercomplete message in the ticket channel
+        buyer_mention = user.mention if user else f"<@{order['userId']}>"
+        qty = order['quantity']
+        product_field = f"[{order['categoryName']} ({qty})]" if qty > 1 else f"[{order['categoryName']}]"
+        await channel.send(
+            f".ordercomplete {product_field} [{order['totalUSD']}] {buyer_mention}"
+        )
         try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An unexpected error occurred.", ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ An unexpected error occurred.", ephemeral=True
-                )
+            await channel.edit(topic=f"Order: {order_id} | Status: delivered | Product: {order['categoryName']}")
         except Exception:
             pass
 
+        # ── Order Finalized card (additional — does not replace .ordercomplete) ──
+        tx_id = ""
+        try:
+            history = await apirone_get_address_history(addr) if addr else []
+            confirmed_tx = next((t for t in history if t.get("is_confirmed")), None)
+            tx_id = (confirmed_tx or (history[0] if history else {})).get("txid", "") or ""
+        except Exception as e:
+            print(f"[order-finalized] Could not fetch tx id: {e}")
+        await send_order_finalized_card(channel, user, order_id, tx_id)
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+    # ── DM: items (as .txt file if >4, else embed) ────────────────────────────
+    if user:
+        if len(items) > 4:
+            import io as _io
+            txt_content = "\n".join(items)
+            if cat and cat.get("instruction"):
+                txt_content += f"\n\n--- Instructions ---\n{cat['instruction']}"
+            txt_file = discord.File(
+                fp=_io.BytesIO(txt_content.encode("utf-8")),
+                filename=f"order-{order_id}.txt",
+            )
+            dm_embed = discord.Embed(
+                title="🔑  Your Order Items",
+                description=(
+                    f"**Product:** {order['categoryName']}\n"
+                    f"**Quantity:** {order['quantity']}\n"
+                    f"**Order ID:** `{order_id}`\n\n"
+                    f"Your items are in the attached `.txt` file (one per line).{instruction_text}"
+                ),
+                color=0x7B2FBE,
+            )
+            dm_embed.set_footer(text=f"Order: {order_id}")
+            try:
+                await user.send(embed=dm_embed, file=txt_file)
+            except Exception:
+                if channel:
+                    import io as _io2
+                    txt_file2 = discord.File(
+                        fp=_io2.BytesIO(txt_content.encode("utf-8")),
+                        filename=f"order-{order_id}.txt",
+                    )
+                    await channel.send(
+                        content=user.mention,
+                        embed=discord.Embed(
+                            title="⚠️  Could Not Send DM — Items Posted Here",
+                            description="Your items are attached below.",
+                            color=0xA855F7,
+                        ),
+                        file=txt_file2,
+                    )
+        else:
+            try:
+                dm = discord.Embed(
+                    title="🔑  Your Order Items",
+                    description=(
+                        f"**Product:** {order['categoryName']}\n"
+                        f"**Quantity:** {order['quantity']}\n"
+                        f"**Order ID:** `{order_id}`\n\n"
+                        f"**Your Items:**\n{delivery_lines}{instruction_text}"
+                    ),
+                    color=0x7B2FBE,
+                )
+                dm.set_footer(text=f"Order: {order_id}")
+                await user.send(embed=dm)
+            except Exception:
+                if channel:
+                    await channel.send(
+                        content=user.mention,
+                        embed=discord.Embed(
+                            title="⚠️  Could Not Send DM — Items Posted Here",
+                            description=delivery_lines + instruction_text,
+                            color=0xA855F7,
+                        )
+                    )
 
-def main() -> None:
-    bot = AutoMMBot()
-    register_commands(bot)
-    bot.tree.on_error = _on_app_command_error
-    log.info("Starting AutoMM bot…")
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    # ── (Sales channel embed removed — .ordercomplete sent in ticket instead) ─
+
+    # ── Admin log ─────────────────────────────────────────────────────────────
+    admin_ping = ""
+    if ADMIN_ROLE_ID:
+        role = guild.get_role(ADMIN_ROLE_ID)
+        admin_ping = role.mention if role else ""
+    sale_embed = discord.Embed(
+        title="🛒  Product Sold",
+        description=(
+            f"**Product:** {order['categoryName']}\n"
+            f"**Qty:** {order['quantity']}\n"
+            f"**Amount:** {actually_paid_ltc} LTC (${order['totalUSD']:.2f})\n"
+            f"**Buyer:** {user.mention if user else order['userId']}\n"
+            f"**Order:** `{order_id}`\n"
+            f"**Address:** `{order.get('ltcAddress', 'N/A')}`"
+        ),
+        color=0x9B59B6,
+    )
+    sale_embed.set_footer(text=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    await send_to_channel(
+        LOG_CHANNEL_ID,
+        content=f"{admin_ping} 🛒 New sale!" if admin_ping else None,
+        embed=sale_embed,
+    )
+
+    # ── Close channel + update panel ──────────────────────────────────────────
+    if channel and user:
+        asyncio.create_task(close_order_channel(channel, buyer=user))
+    asyncio.create_task(auto_update_panel())
+
+    # ── Auto-transfer: after 15s send ALL LTC in account to master wallet ─────
+    asyncio.create_task(_auto_transfer_to_master(order_id, channel))
 
 
-if __name__ == "__main__":
-    main()
+async def _auto_transfer_to_master(order_id: str, ticket_channel=None):
+    """
+    After delivery, wait 15 seconds then transfer the ENTIRE Apirone account
+    LTC balance to the category's custom_ltc_dest if set, otherwise to
+    LTC_WALLET_ADDRESS (master wallet set in env).
+    ticket_channel: the order's ticket channel — receives a sweep confirmation with the real sweep txid.
+    """
+    if not APIRONE_ACCOUNT or not APIRONE_TRANSFER_KEY:
+        print(f"[auto-transfer] Skipping — missing APIRONE_ACCOUNT or APIRONE_TRANSFER_KEY")
+        return
+
+    # Determine destination: per-category override or global wallet
+    order    = await db_get_order(order_id)
+    cat      = await db_get_category(order["categorySlug"]) if order else None
+    dest_addr = (cat.get("custom_ltc_dest") if cat else None) or LTC_WALLET_ADDRESS
+
+    if not dest_addr:
+        print(f"[auto-transfer] Skipping — no destination wallet set")
+        return
+
+    await asyncio.sleep(15)   # wait 15 seconds for confirmations to settle
+
+    # Get current available balance
+    try:
+        url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/balance?currency=ltc"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                bal  = next((b for b in data.get("balance", []) if b.get("currency") == "ltc"), {})
+                avail_litoshis = bal.get("available", 0)
+    except Exception as e:
+        print(f"[auto-transfer] ❌ Could not fetch balance: {e}")
+        return
+
+    if avail_litoshis <= 0:
+        print(f"[auto-transfer] No available balance to transfer for order {order_id}")
+        return
+
+    avail_ltc = avail_litoshis / 1e8
+    print(f"[auto-transfer] Transferring {avail_ltc} LTC → {dest_addr}")
+
+    try:
+        transfer_url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/transfer"
+        payload = {
+            "currency":              "ltc",
+            "transfer-key":          APIRONE_TRANSFER_KEY,
+            "destinations":          [{"address": dest_addr, "amount": "100%"}],
+            "fee":                   "normal",
+            "subtract-fee-from-amount": True,
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.post(transfer_url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                text = await r.text()
+                print(f"[auto-transfer] Response {r.status}: {text[:400]}")
+                if r.status == 200:
+                    import json as _j
+                    d    = _j.loads(text)
+                    txs  = d.get("txs", [])
+                    txid = txs[0] if txs else "N/A"
+                    print(f"[auto-transfer] ✅ Sent! txid={txid} amount={avail_ltc} LTC")
+                    await send_log(discord.Embed(
+                        title="💸  Auto-Transfer Sent",
+                        description=(
+                            f"**Order:** `{order_id}`\n"
+                            f"**Amount:** {avail_ltc} LTC (entire balance)\n"
+                            f"**To:** `{dest_addr}`\n"
+                            f"**TX:** `{txid}`"
+                        ),
+                        color=0x7B2FBE,
+                    ))
+                    # Post sweep txid in the ticket channel
+                    if ticket_channel:
+                        try:
+                            await ticket_channel.send(embed=discord.Embed(
+                                title="🧹  Sweep Successful!",
+                                description=(
+                                    f"**Amount:** `{avail_ltc} LTC`\n"
+                                    f"**To:** `{dest_addr}`\n"
+                                    f"**Sweep TX:**\n```\n{txid}\n```"
+                                ),
+                                color=0x7B2FBE,
+                            ))
+                        except Exception:
+                            pass
+                else:
+                    import json as _j
+                    try:
+                        err = _j.loads(text)
+                        msg = err.get("message") or err.get("error") or text[:200]
+                    except Exception:
+                        msg = text[:200]
+                    print(f"[auto-transfer] ❌ Failed: {msg}")
+                    await send_log(discord.Embed(
+                        title="❌  Auto-Transfer Failed",
+                        description=(
+                            f"**Order:** `{order_id}`\n"
+                            f"**Amount:** {avail_ltc} LTC\n"
+                            f"**Error:** {msg}"
+                        ),
+                        color=0xE74C3C,
+                    ))
+    except Exception as e:
+        print(f"[auto-transfer] ❌ Exception: {e}")
+        import traceback; traceback.print_exc()
+
+
+async def poll_apirone_payment(order_id: str, channel, user):
+    """
+    Poll the Apirone address balance every 30 seconds.
+    Delivers order as soon as total balance >= expected amount.
+    Stops after PAYMENT_TIMEOUT_MIN minutes.
+    """
+    payment_window   = PAYMENT_TIMEOUT_MIN * 60
+    grace_period     = 10 * 60   # 10 min extra grace after timeout
+    extended_timeout = payment_window + grace_period
+    elapsed          = 0
+    interval         = 30
+    detected_notified = False
+    timed_out_notified = False
+
+    print(f"[apirone-poll] Starting for order {order_id}")
+
+    while elapsed < extended_timeout:
+        await asyncio.sleep(interval)
+        elapsed += interval
+
+        order = await db_get_order(order_id)
+        if not order:
+            break
+        if order["status"] in ("delivered", "cancelled", "error"):
+            print(f"[apirone-poll] Order {order_id} is {order['status']} — stopping")
+            break
+
+        # ── Payment window expired notification ───────────────────────────────
+        if elapsed >= payment_window and not timed_out_notified:
+            timed_out_notified = True
+            await db_update_order(order_id, {"status": "expired"})
+            if channel:
+                try:
+                    mention = user.mention if user else ""
+                    await channel.send(
+                        content=mention or None,
+                        embed=discord.Embed(
+                            title="⏰  Payment Window Expired",
+                            description=(
+                                f"The **{PAYMENT_TIMEOUT_MIN}-minute** payment window has closed.\n\n"
+                                "If you already sent LTC — we are still monitoring for 10 more minutes "
+                                "and will deliver automatically if confirmed.\n\n"
+                                "If you haven't paid yet — open a new ticket."
+                            ),
+                            color=0xA855F7,
+                        )
+                    )
+                except Exception:
+                    pass
+
+        addr = order.get("ltcAddress", "")
+        if not addr:
+            continue
+
+        # ── Check address balance via Apirone ─────────────────────────────────
+        try:
+            bal = await apirone_get_address_balance(addr)
+            total_litoshis = bal.get("total", 0)       # includes unconfirmed
+            avail_litoshis = bal.get("available", 0)   # confirmed only
+
+            expected_litoshis = int(order["ltcAmount"] * 1e8)
+            tolerance_litoshis = int(FEE_TOLERANCE_LTC * 1e8)
+
+            print(f"[apirone-poll] order={order_id} expected={expected_litoshis} total={total_litoshis} available={avail_litoshis}")
+
+            addr_url = f"https://blockchair.com/litecoin/address/{addr}" if addr else ""
+
+            # Detected on-chain but unconfirmed
+            if total_litoshis >= (expected_litoshis - tolerance_litoshis) and not detected_notified:
+                detected_notified = True
+                await send_payment_detected_card(channel, user, order["ltcAmount"], addr_url)
+
+            # Confirmed — deliver!
+            if avail_litoshis >= (expected_litoshis - tolerance_litoshis):
+                print(f"[apirone-poll] ✅ Payment confirmed for {order_id}! Delivering...")
+                await send_payment_confirmed_card(channel, user, addr_url)
+                await process_payment_confirmed(order_id, avail_litoshis)
+                break
+
+        except Exception as e:
+            print(f"[apirone-poll] Error checking balance: {e}")
+            continue
+
+    else:
+        order = await db_get_order(order_id)
+        if order and order["status"] not in ("delivered", "cancelled", "error"):
+            await db_update_order(order_id, {"status": "expired"})
+            print(f"[apirone-poll] Order {order_id} fully expired")
+
+
+#  ORDER CHANNEL HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Channel send helpers ──────────────────────────────────────────────────────
+
+async def send_to_channel(channel_id: int, **kwargs):
+    """Send a message to a channel by ID. Silently does nothing if channel not set/found."""
+    if not channel_id:
+        return
+    channel = bot.get_channel(channel_id)
+    if channel:
+        try:
+            await channel.send(**kwargs)
+        except Exception as e:
+            print(f"[log] Failed to send to channel {channel_id}: {e}")
+
+
+async def send_log(embed: discord.Embed):
+    """Send an event log embed to the log channel."""
+    await send_to_channel(LOG_CHANNEL_ID, embed=embed)
+
+
+async def create_order_channel(guild: discord.Guild, user: discord.Member, order_id: str) -> discord.TextChannel:
+    """
+    Create a private text channel for one order.
+    Visible to: the buyer + admin role (or server admins) + bot.
+    Placed inside ORDER_CATEGORY_ID folder if configured.
+    Name format:  order-<shortid>-<username>
+    """
+    short_id  = order_id.split("-")[-1].lower()
+    safe_name = user.display_name.lower().replace(" ", "-")[:20]
+    chan_name = f"order-{short_id}-{safe_name}"
+
+    # Block everyone by default, then grant access selectively
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True),
+        user:               discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+
+    if ADMIN_ROLE_ID:
+        role = guild.get_role(ADMIN_ROLE_ID)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
+            )
+    else:
+        for member in guild.members:
+            if member.guild_permissions.administrator and not member.bot:
+                overwrites[member] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                )
+
+    category = guild.get_channel(ORDER_CATEGORY_ID) if ORDER_CATEGORY_ID else None
+
+    channel = await guild.create_text_channel(
+        name=chan_name,
+        overwrites=overwrites,
+        category=category,
+        topic=f"Order {order_id} | {user.display_name} ({user.id})",
+        reason=f"AutoBuy order {order_id}",
+    )
+    return channel
+
+
+
+# ── Transcript generator ──────────────────────────────────────────────────────
+
+async def generate_transcript(channel: discord.TextChannel) -> discord.File | None:
+    """Fetch all messages and build a Discord-style HTML transcript file."""
+    try:
+        import io
+        messages = []
+        async for msg in channel.history(limit=500, oldest_first=True):
+            messages.append(msg)
+        if not messages:
+            return None
+
+        html_parts = []
+        html_parts.append("""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Transcript</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#313338;color:#dcddde;font-family:"Whitney","Helvetica Neue",Helvetica,Arial,sans-serif;font-size:14px;padding:20px}
+.header{background:#2b2d31;border-bottom:3px solid #5865f2;padding:16px 20px;margin-bottom:20px;border-radius:8px}
+.header h1{color:#fff;font-size:18px}
+.header p{color:#949ba4;font-size:12px;margin-top:4px}
+.message{display:flex;padding:4px 16px;margin:2px 0;border-radius:4px}
+.message:hover{background:#2e3035}
+.avatar{width:40px;height:40px;border-radius:50%;margin-right:12px;flex-shrink:0;overflow:hidden;background:#5865f2;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:15px}
+.avatar img{width:100%;height:100%;border-radius:50%}
+.content{flex:1;min-width:0}
+.meta{display:flex;align-items:baseline;gap:6px;margin-bottom:2px}
+.author{font-weight:600;color:#fff}
+.author.bot-author{color:#5865f2}
+.badge{background:#5865f2;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;font-weight:700;letter-spacing:.3px}
+.ts{font-size:11px;color:#72767d}
+.text{color:#dcddde;line-height:1.5;word-break:break-word}
+.embed{background:#2b2d31;border-left:4px solid #5865f2;border-radius:4px;padding:12px 16px;margin-top:6px;max-width:520px}
+.etitle{color:#fff;font-weight:600;font-size:15px;margin-bottom:6px}
+.edesc{color:#dcddde;font-size:13px;line-height:1.5;white-space:pre-wrap}
+.efield{margin-top:8px}
+.efname{color:#fff;font-weight:600;font-size:12px;margin-bottom:2px}
+.efval{color:#dcddde;font-size:13px}
+.efooter{color:#72767d;font-size:11px;margin-top:10px;border-top:1px solid #3f4147;padding-top:8px}
+.divider{text-align:center;color:#72767d;font-size:11px;margin:16px 0;display:flex;align-items:center;gap:8px}
+.divider::before,.divider::after{content:"";flex:1;height:1px;background:#3f4147}
+code{background:#1e1f22;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:12px;color:#e3e5e8}
+</style></head><body>
+""")
+
+        html_parts.append(
+            f'<div class="header"><h1>📋 Order Transcript — #{channel.name}</h1>'
+            f'<p>Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC &nbsp;|&nbsp; {len(messages)} messages</p></div>\n'
+        )
+
+        prev_author_id = None
+        prev_date      = None
+
+        for msg in messages:
+            msg_date = msg.created_at.strftime("%Y-%m-%d")
+            if msg_date != prev_date:
+                label = msg.created_at.strftime("%B %d, %Y")
+                html_parts.append(f'<div class="divider">{label}</div>\n')
+                prev_date = msg_date
+
+            is_bot   = msg.author.bot
+            av_url   = str(msg.author.display_avatar.url) if msg.author.display_avatar else ""
+            initials = (msg.author.display_name[:2] or "?").upper()
+            av_html  = f'<img src="{av_url}" alt="">' if av_url else initials
+            ac       = "author bot-author" if is_bot else "author"
+            badge    = '<span class="badge">BOT</span>' if is_bot else ""
+            ts       = msg.created_at.strftime("%I:%M %p")
+
+            show_hdr = (msg.author.id != prev_author_id)
+            prev_author_id = msg.author.id
+
+            if show_hdr:
+                html_parts.append(
+                    f'<div class="message"><div class="avatar">{av_html}</div><div class="content">\n'
+                    f'<div class="meta"><span class="{ac}">{msg.author.display_name}</span>{badge}<span class="ts">{ts}</span></div>\n'
+                )
+            else:
+                html_parts.append(
+                    f'<div class="message"><div class="avatar" style="opacity:0">{av_html}</div><div class="content">\n'
+                )
+
+            def esc(s):
+                return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+            if msg.content:
+                html_parts.append(f'<div class="text">{esc(msg.content)}</div>\n')
+
+            for emb in msg.embeds:
+                col = f"#{emb.colour.value:06x}" if emb.colour and emb.colour.value else "#5865f2"
+                html_parts.append(f'<div class="embed" style="border-left-color:{col}">\n')
+                if emb.title:
+                    html_parts.append(f'<div class="etitle">{esc(emb.title)}</div>\n')
+                if emb.description:
+                    html_parts.append(f'<div class="edesc">{esc(emb.description)}</div>\n')
+                for f in emb.fields:
+                    html_parts.append(f'<div class="efield"><div class="efname">{esc(f.name)}</div><div class="efval">{esc(f.value)}</div></div>\n')
+                if emb.footer and emb.footer.text:
+                    html_parts.append(f'<div class="efooter">{esc(emb.footer.text)}</div>\n')
+                html_parts.append('</div>\n')
+
+            html_parts.append('</div></div>\n')
+
+        html_parts.append("</body></html>")
+        html = "".join(html_parts)
+        return discord.File(fp=io.BytesIO(html.encode("utf-8")), filename=f"transcript-{channel.name}.html")
+    except Exception as e:
+        print(f"[transcript] {e}")
+        return None
+
+
+async def _send_transcript(channel: discord.TextChannel, buyer: discord.Member | None):
+    """Generate transcript and send to buyer DM + log channel."""
+    t1 = await generate_transcript(channel)
+    t2 = await generate_transcript(channel)
+
+    dm_embed = discord.Embed(
+        title="📋  Your Order Transcript",
+        description=(
+            f"Here is the full conversation log for **#{channel.name}**.\n"
+            "Open the attached `.html` file in your browser to view it."
+        ),
+        color=0x7C3AED,
+    )
+    dm_embed.set_footer(text="Transcript auto-generated after order completion.")
+
+    if buyer and t1:
+        try:
+            await buyer.send(embed=dm_embed, file=t1)
+        except Exception:
+            pass
+
+    if t2 and LOG_CHANNEL_ID:
+        log_embed = discord.Embed(
+            title="📋  Order Transcript",
+            description=f"Channel: **#{channel.name}**",
+            color=0x7C3AED,
+        )
+        await send_to_channel(LOG_CHANNEL_ID, embed=log_embed, file=t2)
+
+
+async def close_order_channel(channel: discord.TextChannel, buyer: discord.Member = None):
+    """
+    2-phase closure after delivery:
+      Phase 1 (10 min)  — buyer loses send permission, transcript sent
+      Phase 2 (60 min)  — channel hidden from buyer, admins keep access forever
+    """
+    try:
+        await channel.send(embed=discord.Embed(
+            title="🔒  Channel Closing",
+            description="This channel will be **locked in 10 minutes** and **hidden in 60 minutes**.\nA transcript will be sent to your DMs.",
+            color=0x7C3AED,
+        ))
+
+        # Rename to closed- so admins can see at a glance
+        try:
+            new_name = "closed-" + channel.name.replace("order-", "")
+            await channel.edit(name=new_name)
+        except Exception:
+            pass
+
+        # Rename to closed- so admins can see delivery status
+        try:
+            new_name = "closed-" + channel.name.replace("order-", "")
+            await channel.edit(name=new_name)
+        except Exception:
+            pass
+
+        # ── Phase 1: lock writing after 10 minutes ────────────────────────────
+        await asyncio.sleep(600)
+
+        if buyer:
+            await channel.set_permissions(buyer, send_messages=False, read_messages=True)
+        # Explicitly keep default_role hidden — just removing send is not enough
+        await channel.set_permissions(channel.guild.default_role, view_channel=False, send_messages=False)
+
+        await channel.send(embed=discord.Embed(
+            title="🔒  Channel Locked",
+            description="This channel has been locked. It will be hidden from your view in 50 minutes.\nYour transcript has been sent to your DMs.",
+            color=0x7C3AED,
+        ))
+
+        # Send transcript now (while buyer can still see the lock message)
+        await _send_transcript(channel, buyer)
+
+        # ── Phase 2: hide from buyer after 60 minutes total ──────────────────
+        await asyncio.sleep(3000)   # 50 more minutes
+
+        if buyer:
+            await channel.set_permissions(buyer, view_channel=False, send_messages=False)
+
+        # Tag the order as archived in DB
+        if channel.topic:
+            for part in channel.topic.split("|"):
+                part = part.strip()
+                if part.startswith("ORD-"):
+                    await db_update_order(part, {"channelArchived": True})
+                    break
+
+    except Exception as e:
+        print(f"[channel close] {e}")
+
+
+async def close_order_channel_cancel(channel: discord.TextChannel, buyer: discord.Member = None):
+    """Faster close for cancelled orders: lock immediately, rename, hide in 10 min."""
+    try:
+        # Rename to closed- so admins can see status at a glance
+        try:
+            new_name = "closed-" + channel.name.replace("order-", "")
+            await channel.edit(name=new_name)
+        except Exception:
+            pass
+
+        await channel.send(embed=discord.Embed(
+            title="❌  Order Cancelled",
+            description="This channel will be hidden in 10 minutes. A transcript has been sent to your DMs.",
+            color=0xE74C3C,
+        ))
+
+        if buyer:
+            await channel.set_permissions(buyer, send_messages=False, read_messages=True)
+        # Explicitly keep default_role hidden
+        await channel.set_permissions(channel.guild.default_role, view_channel=False, send_messages=False)
+
+        await _send_transcript(channel, buyer)
+        await asyncio.sleep(600)
+
+        if buyer:
+            await channel.set_permissions(buyer, view_channel=False, send_messages=False)
+
+    except Exception as e:
+        print(f"[channel cancel close] {e}")
+
+
+# ── Order Finalized card (Components V2) ──────────────────────────────────────
+# Uses the custom emojis uploaded via &setupemojis (bot_noentry, bot_pin,
+# bot_assistance, bot_sweep, bot_lock). Falls back to unicode if not uploaded yet.
+
+class _OrderFinalizedCloseButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="Close (Admin)",
+            emoji="🔒",
+            custom_id="orderfinalized:close",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        is_allowed = member.guild_permissions.administrator if isinstance(member, discord.Member) else False
+        if not is_allowed and ADMIN_ROLE_ID and isinstance(member, discord.Member):
+            role = interaction.guild.get_role(ADMIN_ROLE_ID) if interaction.guild else None
+            is_allowed = bool(role and role in member.roles)
+        if not is_allowed:
+            await interaction.response.send_message(
+                "🔒 This button is restricted to administrators.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message("🔒 Closing this ticket...", ephemeral=True)
+        buyer = None
+        for target, ow in interaction.channel.overwrites.items():
+            if isinstance(target, discord.Member) and not target.bot and not target.guild_permissions.administrator:
+                buyer = target
+                break
+        asyncio.create_task(close_order_channel_cancel(interaction.channel, buyer=buyer))
+
+
+class _OrderFinalizedAssistanceButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="Need Assistance",
+            emoji="🧑‍💼",
+            custom_id="orderfinalized:assist",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        ping = ""
+        if ADMIN_ROLE_ID and interaction.guild:
+            role = interaction.guild.get_role(ADMIN_ROLE_ID)
+            ping = role.mention if role else ""
+        await interaction.response.send_message(
+            content=(f"{ping} " if ping else "") + f"{interaction.user.mention} needs assistance with this order."
+        )
+
+
+class OrderFinalizedView(discord.ui.View):
+    """Persistent view attached to the Order Finalized card."""
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(_OrderFinalizedCloseButton())
+        self.add_item(_OrderFinalizedAssistanceButton())
+
+
+async def send_order_finalized_card(channel, user, order_id: str, tx_id: str = ""):
+    """Components V2 'Order Finalized' card — sent after payment is confirmed and
+    items are delivered. Does NOT replace the existing `.ordercomplete` ticket
+    tool message; this is an additional card shown to the buyer."""
+    if not channel:
+        return
+    guild = getattr(channel, "guild", None)
+
+    e_cart       = get_bot_emoji(guild, "bot_cart", "🛒")
+    e_noentry    = get_bot_emoji(guild, "bot_noentry", "🚫")
+    e_pin        = get_bot_emoji(guild, "bot_pin", "📌")
+    e_assistance = get_bot_emoji(guild, "bot_assistance", "🧑‍💼")
+    e_sweep      = get_bot_emoji(guild, "bot_sweep", "🧹")
+
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=discord.Colour(0x5865F2))
+    container.add_item(discord.ui.TextDisplay(f"## {e_cart}  Order Finalized"))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        f"{e_noentry}  {user.mention if user else 'Buyer'}, your ticket is now read-only."
+    ))
+    container.add_item(discord.ui.TextDisplay(
+        f"{e_pin}  If you need help with your order, please click the {e_assistance} "
+        "Need Assistance button below."
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(f"{e_sweep}  Payment TX"))
+    container.add_item(discord.ui.TextDisplay(f"```\n{tx_id or 'N/A'}\n```"))
+
+    row = discord.ui.ActionRow()
+    row.add_item(_OrderFinalizedCloseButton())
+    row.add_item(_OrderFinalizedAssistanceButton())
+    container.add_item(row)
+
+    view.add_item(container)
+
+    try:
+        await channel.send(view=view)
+    except Exception as e:
+        print(f"[card] Failed to send Order Finalized card: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DISCORD UI — VIEWS & MODALS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def handle_product_select(
+    interaction: discord.Interaction,
+    slug: str,
+    home_channel: discord.TextChannel = None,
+    buyer: discord.Member = None,
+):
+    """
+    Called when user picks a product from the in-ticket dropdown.
+    The ticket channel already exists (home_channel).
+    Posts quantity buttons directly in the channel — visible to everyone.
+    """
+    if slug == "none":
+        await interaction.response.send_message("No products available.", ephemeral=True)
+        return
+
+    cat = await db_get_category(slug)
+    if not cat:
+        await interaction.response.send_message("Product not found.", ephemeral=True)
+        return
+
+    channel = home_channel or interaction.channel
+    user    = buyer or interaction.user
+
+    if len(cat.get("stock", [])) == 0 and not cat.get("infinite_stock"):
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="Out of Stock",
+                description=f"**{cat['name']}** is currently unavailable.",
+                color=0xE74C3C,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    # Show ToC if set — post VISIBLY in the channel (not ephemeral)
+    toc_message = await get_toc(slug)
+    if toc_message:
+        await interaction.response.defer(ephemeral=True)
+        toc_embed = discord.Embed(
+            title="📜  Terms & Conditions",
+            description=(
+                "**" + cat["name"] + "** — please read and accept the terms below:\n\n"
+                + toc_message
+            ),
+            color=0xA855F7,
+        )
+        toc_embed.set_footer(text="React with the buttons below to accept or decline.")
+        await channel.send(
+            content=user.mention,
+            embed=toc_embed,
+            view=ToCChannelView(slug, cat, channel, user),
+        )
+        return
+
+    # No ToC — post quantity question in channel
+    await interaction.response.defer(ephemeral=True)
+    await _ask_quantity_in_channel(channel, cat, user)
+
+
+async def _ask_quantity_in_channel(channel: discord.TextChannel, cat: dict, user: discord.Member):
+    """Post the Select Quantity picker in the ticket channel (button-based, no text listening)."""
+    min_qty = int(cat.get("min_quantity") or 1)
+    view    = QuantityPickerView(cat=cat, user=user, channel=channel, qty=min_qty)
+    await channel.send(content=user.mention, embed=_build_qty_picker_embed(cat, min_qty), view=view)
+
+
+
+# ── Panel (persistent — survives bot restart) ──────────────────────────────────
+# ── Panel helpers ─────────────────────────────────────────────────────────────
+
+async def build_panel_embed() -> discord.Embed:
+    """Build the main shop panel embed — styled to match NoxStore design."""
+    cats        = await db_get_categories()
+    total_stock = sum(len(c.get("stock", [])) if not c.get("infinite_stock") else 9999 for c in cats)
+    active      = len(cats)
+    shop_name   = await get_setting("shop_name")
+    banner_url  = await get_setting("banner_url")
+    icon_url    = await get_setting("icon_url")
+
+    embed = discord.Embed(
+        title=f"{shop_name} | Autobuy",
+        description=(
+            "**Instant Delivery • 24/7 Support**\n\n"
+            "Select a product from the dropdown menu below to start.\n"
+            "Payments are processed automatically via Litecoin (LTC).\n"
+            "\u200b"
+        ),
+        color=0x9B59B6,
+    )
+
+    if icon_url:
+        embed.set_thumbnail(url=icon_url)
+
+    # Live stats block — styled like the screenshot
+    stock_display = "∞" if total_stock >= 9999 else str(total_stock)
+    embed.add_field(
+        name="<:statusup:1550066141253345341> Live Store Statistics",
+        value=(
+            "<a:Green_dot1:1550066113352826981> **System Status:** Online\n"
+            "• <a:65023lightning:1550066109170843678> **Active Products:** " + str(active) + "\n"
+            "• <:emojigg_box:1550066472187985920> **Total Stock:** " + stock_display + "\n"
+            "• <:5636activity:1550066108017418260> **Delivery Speed:** Instant"
+        ),
+        inline=False,
+    )
+
+    if banner_url:
+        embed.set_image(url=banner_url)
+
+    embed.set_footer(text=f"{shop_name} Automations • Live Updates")
+    return embed
+
+
+async def build_panel_select(all_cats: bool = True) -> discord.ui.Select:
+    """Build the product dropdown with live stock status indicators."""
+    cats = await db_get_categories()
+
+    if not cats:
+        sel = discord.ui.Select(
+            placeholder="No products available",
+            options=[discord.SelectOption(label="No products", value="none", emoji="🔴")],
+            disabled=True,
+            custom_id="panel:select",
+        )
+        return sel
+
+    options = []
+    for c in cats:
+        is_infinite = bool(c.get("infinite_stock"))
+        count = len(c.get("stock", [])) if not is_infinite else 9999
+        if is_infinite:
+            emoji = "🟢"
+            desc  = f"∞ unlimited • ${c['price_usd']:.2f}"
+        elif count == 0:
+            emoji = "🔴"
+            desc  = f"Out of stock • ${c['price_usd']:.2f}"
+        elif count <= 3:
+            emoji = "🟡"
+            desc  = f"{count} left • ${c['price_usd']:.2f}"
+        else:
+            emoji = "🟢"
+            desc  = f"{count} in stock • ${c['price_usd']:.2f}"
+
+        options.append(discord.SelectOption(
+            label=c["name"],
+            description=desc,
+            value=c["slug"],
+            emoji=emoji,
+        ))
+
+    sel = discord.ui.Select(
+        placeholder="Select a product to purchase...",
+        options=options,
+        custom_id="panel:select",
+    )
+    return sel
+
+
+async def auto_update_panel():
+    """Auto-refreshes panel embed stats."""
+    try:
+        msg_id = await get_setting("panel_message_id")
+        ch_id  = await get_setting("panel_channel_id")
+        if not msg_id or not ch_id:
+            return
+        guild = bot.guilds[0] if bot.guilds else None
+        if not guild:
+            return
+        channel = guild.get_channel(int(ch_id))
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+        except Exception:
+            return
+        await msg.edit(embed=await build_panel_embed(), view=PanelView())
+        print(f"[panel] ✅ Auto-updated in #{channel.name}")
+    except Exception as e:
+        print(f"[panel] Auto-update failed: {e}")
+
+
+class PanelView(discord.ui.View):
+    """
+    Main shop panel — single dropdown with two options:
+      1. 📦 Stock         — show live stock (ephemeral)
+      2. 🎫 Create Ticket — open an order ticket
+    """
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        self.panel_select = discord.ui.Select(
+            placeholder="🛒  Click Here To Select a product.",
+            options=[
+                discord.SelectOption(
+                    label="Stock",
+                    description="View live stock counts for all products",
+                    value="action:stock",
+                    emoji="📦",
+                ),
+                discord.SelectOption(
+                    label="Click to create AutoBuy ticket",
+                    description="Open a private order ticket to make a purchase",
+                    value="action:ticket",
+                    emoji="🎫",
+                ),
+            ],
+            custom_id="panel:main_select",
+        )
+        self.panel_select.callback = self._on_select
+        self.add_item(self.panel_select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        chosen = interaction.data["values"][0]
+
+        if chosen == "action:stock":
+            await interaction.response.defer(ephemeral=True)
+            cats  = await db_get_categories()
+            embed = discord.Embed(
+                title="📦  Live Store Stock",
+                description="Real-time stock levels across all products.",
+                color=0x9B59B6,
+            )
+            embed.set_footer(text="Stock updates automatically with every purchase")
+            if not cats:
+                embed.description = "No products are currently available."
+            else:
+                for c in cats:
+                    is_inf = bool(c.get("infinite_stock"))
+                    count  = len(c.get("stock", [])) if not is_inf else 9999
+                    if is_inf:
+                        badge = "♾️  Unlimited"
+                        dot   = "🟢"
+                    elif count == 0:
+                        badge = "❌  Out of Stock"
+                        dot   = "🔴"
+                    elif count <= 3:
+                        badge = f"⚠️  {count} remaining — Low Stock"
+                        dot   = "🟡"
+                    else:
+                        badge = f"✅  {count} available"
+                        dot   = "🟢"
+
+                    min_qty = int(c.get("min_quantity") or 1)
+                    price_line = f"💲 **Price:** ${c['price_usd']:.2f}"
+                    min_line   = f"  •  🔢 **Min Order:** {min_qty}" if min_qty > 1 else ""
+                    embed.add_field(
+                        name=f"{dot}  {c['name']}",
+                        value=f"{price_line}{min_line}\n{badge}",
+                        inline=True,
+                    )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        elif chosen == "action:ticket":
+            await interaction.response.defer(ephemeral=True)
+
+            # Check blacklist
+            bl = await col_blacklist.find_one({"userId": str(interaction.user.id)})
+            if bl:
+                await interaction.followup.send(embed=discord.Embed(
+                    title="🔒  Access Restricted",
+                    description=(
+                        "Your account has been restricted from making purchases.\n"
+                        "Please contact an admin if you believe this is an error."
+                    ),
+                    color=0xE74C3C,
+                ), ephemeral=True)
+                return
+
+            import random as _r, string as _s
+            temp_id = "ORD-" + "".join(_r.choices(_s.ascii_uppercase + _s.digits, k=8))
+            try:
+                channel = await create_order_channel(interaction.guild, interaction.user, temp_id)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="⚠️  Permission Error",
+                        description="The bot lacks the **Manage Channels** permission. Please contact an admin.",
+                        color=0xE74C3C,
+                    ), ephemeral=True
+                )
+                return
+
+            open_view = discord.ui.View(timeout=300)
+            open_view.add_item(discord.ui.Button(
+                label="🎫  Open My Ticket",
+                style=discord.ButtonStyle.link,
+                url=f"https://discord.com/channels/{interaction.guild.id}/{channel.id}",
+            ))
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="🎫  Ticket Created",
+                    description=(
+                        f"Your private order ticket has been opened.\n\n"
+                        f"**Channel:** {channel.mention}\n\n"
+                        "Head over and select your product to continue."
+                    ),
+                    color=0x7B2FBE,
+                ),
+                view=open_view,
+                ephemeral=True,
+            )
+            await _post_ticket_welcome(channel, interaction.user)
+
+
+
+async def _post_ticket_welcome(channel: discord.TextChannel, user: discord.Member):
+    shop_name = await get_setting("shop_name") or "AutoBuy"
+    icon_url  = await get_setting("icon_url")
+    banner    = await get_setting("banner_url")
+
+    welcome = discord.Embed(
+        title=f"🎫  Welcome to Your Order Ticket",
+        description=(
+            f"Hey {user.mention}, your private ticket is ready.\n\n"
+            "Use the **product dropdown** below to select what you'd like to purchase. "
+            "Payment is handled automatically via **Litecoin (LTC)** — no manual steps needed.\n\n"
+            "If you need help at any point, click **🆘 Request Admin Support** in the invoice view."
+        ),
+        color=0x9B59B6,
+    )
+    if icon_url:
+        welcome.set_thumbnail(url=icon_url)
+    if banner:
+        welcome.set_image(url=banner)
+    welcome.set_footer(text=f"{shop_name}  •  All Rights Reserved")
+
+    close_view = discord.ui.View(timeout=None)
+    close_btn  = discord.ui.Button(label="🔒  Close Ticket", style=discord.ButtonStyle.danger)
+
+    async def _close(inter: discord.Interaction, _b=None):
+        is_owner        = inter.user.id == user.id
+        is_admin_member = ADMIN_ROLE_ID and any(r.id == ADMIN_ROLE_ID for r in inter.user.roles)
+        if is_owner or is_admin_member or inter.user.guild_permissions.administrator:
+            asyncio.create_task(close_order_channel_cancel(channel, buyer=user))
+            await inter.response.send_message("🔒 Closing your ticket...", ephemeral=True)
+        else:
+            await inter.response.send_message("Only the ticket owner or an admin can close this ticket.", ephemeral=True)
+
+    close_btn.callback = _close
+    close_view.add_item(close_btn)
+    await channel.send(content=user.mention, embed=welcome, view=close_view)
+
+    cats = await db_get_categories()
+    if not cats:
+        await channel.send(embed=discord.Embed(
+            title="📭  No Products Available",
+            description="There are currently no products in stock. Please check back later or contact an admin.",
+            color=0xE74C3C,
+        ))
+        return
+
+    options = []
+    for c in cats:
+        is_infinite = bool(c.get("infinite_stock"))
+        count = len(c.get("stock", [])) if not is_infinite else 9999
+        if is_infinite:
+            emoji = "🟢"
+            desc  = "∞ Unlimited  •  $" + str(c["price_usd"])
+        elif count == 0:
+            emoji = "🔴"
+            desc  = "Out of Stock"
+        else:
+            emoji = "🟡" if count <= 3 else "🟢"
+            desc  = str(count) + " in stock  •  $" + str(c["price_usd"])
+        options.append(discord.SelectOption(label=c["name"], description=desc, value=c["slug"], emoji=emoji))
+
+    sel = discord.ui.Select(
+        placeholder="🛍️  Select a product to purchase...",
+        options=options,
+    )
+
+    async def _on_select(inter: discord.Interaction):
+        await handle_product_select(inter, inter.data["values"][0], home_channel=channel, buyer=user)
+
+    sel.callback = _on_select
+    sel_view = discord.ui.View(timeout=PAYMENT_TIMEOUT_MIN * 60)
+    sel_view.add_item(sel)
+
+    product_embed = discord.Embed(
+        title="🛒  Choose Your Product",
+        description=(
+            "Select a product from the dropdown below to view pricing and proceed to checkout.\n"
+            "Stock levels update in real-time."
+        ),
+        color=0x9B59B6,
+    )
+    product_embed.set_footer(text="🟢 In Stock  •  🟡 Low Stock  •  🔴 Out of Stock")
+    await channel.send(embed=product_embed, view=sel_view)
+
+
+
+
+class ToCAcceptedView(discord.ui.View):
+    """Replaces the ToC buttons after the user accepts — shows a disabled 'Accepted' button."""
+    def __init__(self, display_name: str):
+        super().__init__(timeout=None)
+        accepted_btn = discord.ui.Button(
+            label=f"✅  Accepted by {display_name}",
+            style=discord.ButtonStyle.success,
+            disabled=True,
+        )
+        self.add_item(accepted_btn)
+
+
+class ToCChannelView(discord.ui.View):
+    """ToC accept/decline posted visibly inside the ticket channel."""
+    def __init__(self, slug, cat, channel, user):
+        super().__init__(timeout=600)
+        self.slug    = slug
+        self.cat     = cat
+        self.channel = channel
+        self.user    = user
+
+    @discord.ui.button(label="✅  I Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _b):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return
+        cat = await db_get_category(self.slug)
+        if not cat or len(cat.get("stock", [])) == 0:
+            await interaction.response.send_message("This product is no longer available.", ephemeral=True)
+            return
+        # Keep the original ToC embed visible — just swap buttons to disabled "ToC Accepted"
+        original_embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(
+            title="📜  Terms & Conditions", color=0x7B2FBE
+        )
+        original_embed.color = 0x2ECC71
+        await interaction.response.edit_message(embed=original_embed, view=ToCAcceptedView(interaction.user.display_name))
+        await _ask_quantity_in_channel(self.channel, cat, self.user)
+
+    @discord.ui.button(label="❌  Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, _b):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return
+        original_embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(
+            title="📜  Terms & Conditions", color=0xE74C3C
+        )
+        original_embed.color = 0xE74C3C
+        declined_view = discord.ui.View()
+        declined_btn  = discord.ui.Button(label="❌  Declined", style=discord.ButtonStyle.danger, disabled=True)
+        declined_view.add_item(declined_btn)
+        await interaction.response.edit_message(embed=original_embed, view=declined_view)
+
+
+class ToCView(discord.ui.View):
+    """Ephemeral ToC shown before purchase (legacy/fallback path)."""
+    def __init__(self, slug: str, cat: dict):
+        super().__init__(timeout=120)
+        self.slug = slug
+        self.cat  = cat
+
+    @discord.ui.button(label="✅  I Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _b):
+        cat = await db_get_category(self.slug)
+        if not cat or len(cat.get("stock", [])) == 0:
+            await interaction.response.send_message("This product is no longer available.", ephemeral=True)
+            return
+        # Keep ToC embed, replace buttons with disabled accepted state
+        original_embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(
+            title="📜  Terms & Conditions", color=0x7B2FBE
+        )
+        original_embed.color = 0x2ECC71
+        await interaction.response.edit_message(embed=original_embed, view=ToCAcceptedView(interaction.user.display_name))
+        await _ask_quantity_in_channel(interaction.channel, cat, interaction.user)
+
+    @discord.ui.button(label="❌  Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, _b):
+        original_embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(
+            title="📜  Terms & Conditions", color=0xE74C3C
+        )
+        original_embed.color = 0xE74C3C
+        declined_view = discord.ui.View()
+        declined_view.add_item(discord.ui.Button(label="❌  Declined", style=discord.ButtonStyle.danger, disabled=True))
+        await interaction.response.edit_message(embed=original_embed, view=declined_view)
+
+
+class ProductCardView(discord.ui.View):
+    """Shown after selecting a product — has a Buy button."""
+    def __init__(self, slug: str, can_buy: bool):
+        super().__init__(timeout=120)
+        self.slug = slug
+
+        buy_btn = discord.ui.Button(
+            label="🛒 Buy Now",
+            style=discord.ButtonStyle.success,
+            disabled=not can_buy,
+        )
+        buy_btn.callback = self._on_buy
+        self.add_item(buy_btn)
+
+    async def _on_buy(self, interaction: discord.Interaction):
+        cat = await db_get_category(self.slug)
+        if not cat or len(cat.get("stock", [])) == 0:
+            await interaction.response.send_message("❌ This product is out of stock.", ephemeral=True)
+            return
+
+        # ── Show ToC if set for this category ────────────────────────────────
+        toc_message = await get_toc(self.slug)
+        if toc_message:
+            toc_embed = discord.Embed(
+                title="📜  Terms & Conditions",
+                description=(
+                    f"Before purchasing **{cat['name']}**, please read and accept the terms below:\n\n"
+                    f"{toc_message}"
+                ),
+                color=0xA855F7,
+            )
+            toc_embed.set_footer(text="You must accept the Terms & Conditions to proceed with your purchase.")
+            await interaction.response.send_message(
+                embed=toc_embed,
+                view=ToCView(self.slug, cat),
+                ephemeral=True,
+            )
+        else:
+            # No ToC — create ticket channel and show quantity picker inside it
+            await interaction.response.defer(ephemeral=True)
+            import random as _r2, string as _s2
+            temp_id = "ORD-" + "".join(_r2.choices(_s2.ascii_uppercase + _s2.digits, k=8))
+            try:
+                channel = await create_order_channel(interaction.guild, interaction.user, temp_id)
+            except discord.Forbidden:
+                await interaction.followup.send("Bot lacks Manage Channels permission.", ephemeral=True)
+                return
+            min_qty = int(cat.get("min_quantity") or 1)
+            view    = QuantityPickerView(cat=cat, user=interaction.user, channel=channel, qty=min_qty)
+            await channel.send(content=interaction.user.mention, embed=_build_qty_picker_embed(cat, min_qty), view=view)
+            open_view = discord.ui.View(timeout=300)
+            open_view.add_item(discord.ui.Button(
+                label="Open Ticket",
+                style=discord.ButtonStyle.link,
+                url=f"https://discord.com/channels/{interaction.guild.id}/{channel.id}",
+            ))
+            await interaction.followup.send(
+                embed=discord.Embed(title="🎫  Ticket Created", description=channel.mention, color=0x7B2FBE),
+                view=open_view, ephemeral=True,
+            )
+
+
+
+class QuantityPickerView(discord.ui.View):
+    """
+    Image 1 — Select Quantity.
+    −/✏️/+ buttons on row 0, Continue/Cancel Ticket on row 1.
+    Order is NOT created until the user clicks Continue.
+    Pass order_id to update an existing order (Change Quantity flow from PurchaseSummaryView).
+    """
+    def __init__(self, cat: dict, user: discord.Member, channel,
+                 qty: int = 1, order_id: str | None = None):
+        super().__init__(timeout=PAYMENT_TIMEOUT_MIN * 60)
+        self.cat      = cat
+        self.user     = user
+        self.channel  = channel
+        self.qty      = max(int(cat.get("min_quantity") or 1), qty)
+        self.order_id = order_id
+        self._rebuild_buttons()
+
+    def _rebuild_buttons(self):
+        self.clear_items()
+        is_infinite = bool(self.cat.get("infinite_stock"))
+        stock_count = len(self.cat.get("stock", [])) if not is_infinite else 9999
+        min_qty     = int(self.cat.get("min_quantity") or 1)
+
+        minus_btn          = discord.ui.Button(label="−", style=discord.ButtonStyle.secondary, row=0)
+        minus_btn.disabled = self.qty <= min_qty
+        minus_btn.callback = self._on_minus
+        self.add_item(minus_btn)
+
+        pencil_btn          = discord.ui.Button(label=f"✏️  {self.qty}", style=discord.ButtonStyle.primary, row=0)
+        pencil_btn.callback = self._on_pencil
+        self.add_item(pencil_btn)
+
+        plus_btn          = discord.ui.Button(label="+", style=discord.ButtonStyle.secondary, row=0)
+        plus_btn.disabled = self.qty >= stock_count
+        plus_btn.callback = self._on_plus
+        self.add_item(plus_btn)
+
+        cont_btn          = discord.ui.Button(label="Continue", style=discord.ButtonStyle.success, row=1)
+        cont_btn.callback = self._on_continue
+        self.add_item(cont_btn)
+
+        cancel_btn          = discord.ui.Button(label="Cancel Ticket", style=discord.ButtonStyle.danger, row=1)
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def _check_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_minus(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+        min_qty  = int(self.cat.get("min_quantity") or 1)
+        self.qty = max(min_qty, self.qty - 1)
+        self._rebuild_buttons()
+        await interaction.response.edit_message(embed=_build_qty_picker_embed(self.cat, self.qty), view=self)
+
+    async def _on_plus(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+        is_infinite = bool(self.cat.get("infinite_stock"))
+        stock_count = len(self.cat.get("stock", [])) if not is_infinite else 9999
+        self.qty    = min(stock_count, self.qty + 1)
+        self._rebuild_buttons()
+        await interaction.response.edit_message(embed=_build_qty_picker_embed(self.cat, self.qty), view=self)
+
+    async def _on_pencil(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+        await interaction.response.send_modal(QtyTypeModal(self))
+
+    async def _on_continue(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+        await interaction.response.defer()
+        cat = await db_get_category(self.cat["slug"])
+        if not cat:
+            await interaction.followup.send("Product not found.", ephemeral=True)
+            return
+
+        is_infinite = bool(cat.get("infinite_stock"))
+        stock_count = len(cat.get("stock", [])) if not is_infinite else 9999
+        min_qty     = int(cat.get("min_quantity") or 1)
+        qty         = self.qty
+
+        if qty < min_qty:
+            await interaction.followup.send(f"❌ Minimum order is **{min_qty}**.", ephemeral=True)
+            return
+        if qty > stock_count:
+            await interaction.followup.send(f"❌ Only **{stock_count}** in stock.", ephemeral=True)
+            return
+
+        ltc_price  = await ltc_get_price()
+        total_usd  = round(cat["price_usd"] * qty, 2)
+        ltc_amount = round(total_usd / ltc_price, 6)
+
+        if self.order_id:
+            # Change Quantity flow — update existing order
+            await db_update_order(self.order_id, {
+                "quantity":  qty,
+                "totalUSD":  total_usd,
+                "ltcAmount": ltc_amount,
+            })
+            order = await db_get_order(self.order_id)
+            if not order:
+                await interaction.followup.send("❌ Order not found — it may have expired. Please start a new order.", ephemeral=True)
+                return
+        else:
+            # Fresh order
+            order = await db_create_order(
+                user_id=str(interaction.user.id), slug=cat["slug"], cat_name=cat["name"],
+                quantity=qty, total_usd=total_usd, ltc_amount=ltc_amount, ltc_address=LTC_WALLET_ADDRESS,
+            )
+            await db_update_order(order["orderId"], {"channelId": str(self.channel.id)})
+            np_result = await _create_invoice_or_fail(order["orderId"], ltc_amount, total_usd, self.channel, interaction.user)
+            if not np_result:
+                return
+            await db_update_order(order["orderId"], {
+                "ltcAddress": np_result["pay_address"],
+                "ltcAmount":  np_result["pay_amount"],
+            })
+
+            await send_log(discord.Embed(
+                title="🆕  New Order Opened",
+                description=(
+                    f"**Order:** `{order['orderId']}`\n"
+                    f"**User:** {interaction.user.mention}\n"
+                    f"**Product:** {cat['name']} x{qty}\n"
+                    f"**Amount:** {ltc_amount} LTC (${total_usd})"
+                ),
+                color=0x9B59B6,
+            ))
+
+            try:
+                await self.channel.edit(topic=f"Order: {order['orderId']} | Status: pending | Product: {cat['name']}")
+            except Exception:
+                pass
+
+        await interaction.message.edit(
+            embed=_build_purchase_summary_embed(cat, qty),
+            view=PurchaseSummaryView(order["orderId"], cat, qty, ltc_amount, total_usd, ltc_price),
+        )
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+        if self.order_id:
+            await db_update_order(self.order_id, {"status": "cancelled"})
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🚫  Order Cancelled",
+                description="Your order has been cancelled successfully. Feel free to open a new ticket at any time.",
+                color=0xE74C3C,
+            ),
+            view=None,
+        )
+        asyncio.create_task(close_order_channel_cancel(self.channel, buyer=interaction.user))
+
+
+class QtyTypeModal(discord.ui.Modal, title="Enter Quantity"):
+    """Opened by the ✏️ pencil button on QuantityPickerView."""
+    def __init__(self, picker: "QuantityPickerView"):
+        super().__init__()
+        self.picker = picker
+        min_q = int(picker.cat.get("min_quantity") or 1)
+        self.qty_input = discord.ui.TextInput(
+            label=f"Quantity (min {min_q})" if min_q > 1 else "Quantity",
+            placeholder=f"Enter a number e.g. {picker.qty}",
+            default=str(picker.qty),
+            min_length=1, max_length=5, required=True,
+        )
+        self.add_item(self.qty_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.qty_input.value.strip()
+        if not raw.isdigit() or int(raw) < 1:
+            await interaction.response.send_message("❌ Please enter a valid number.", ephemeral=True)
+            return
+        cat         = await db_get_category(self.picker.cat["slug"])
+        is_infinite = bool(cat.get("infinite_stock"))
+        stock_count = len(cat.get("stock", [])) if not is_infinite else 9999
+        min_qty     = int(cat.get("min_quantity") or 1)
+        qty         = int(raw)
+        if qty < min_qty:
+            await interaction.response.send_message(f"❌ Minimum order is **{min_qty}**.", ephemeral=True)
+            return
+        if qty > stock_count:
+            await interaction.response.send_message(f"❌ Only **{stock_count}** in stock.", ephemeral=True)
+            return
+        self.picker.qty = qty
+        self.picker._rebuild_buttons()
+        await interaction.response.edit_message(
+            embed=_build_qty_picker_embed(self.picker.cat, qty),
+            view=self.picker,
+        )
+
+
+class PurchaseSummaryView(discord.ui.View):
+    """Image 2 — Purchase Summary. Shown after the user confirms qty in QuantityPickerView."""
+    def __init__(self, order_id, cat, qty, ltc_amount, total_usd, ltc_price):
+        super().__init__(timeout=PAYMENT_TIMEOUT_MIN * 60)
+        self.order_id   = order_id
+        self.cat        = cat
+        self.qty        = qty
+        self.ltc_amount = ltc_amount
+        self.total_usd  = total_usd
+        self.ltc_price  = ltc_price
+
+    @discord.ui.button(label="🛒  Change Quantity", style=discord.ButtonStyle.primary)
+    async def change_qty(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        if not order or order["userId"] != str(interaction.user.id):
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return
+        # Go back to Image 1 picker with existing order_id so Continue updates instead of creates
+        view = QuantityPickerView(
+            cat=self.cat, user=interaction.user,
+            channel=interaction.channel, qty=self.qty, order_id=self.order_id,
+        )
+        await interaction.response.edit_message(
+            embed=_build_qty_picker_embed(self.cat, self.qty),
+            view=view,
+        )
+
+    @discord.ui.button(label="💸  Continue to Payment", style=discord.ButtonStyle.success)
+    async def continue_payment(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        if not order or order["userId"] != str(interaction.user.id):
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return
+        if order["status"] in ("cancelled", "expired"):
+            await interaction.response.send_message("Order no longer active.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="⏳  Generating invoice...", color=0x1E0A3C),
+            view=None,
+        )
+        await asyncio.sleep(1)
+
+        addr     = order.get("ltcAddress") or ""
+        pay_link = order.get("payLink") or ""
+        amt      = order["ltcAmount"]
+        usd      = round(order["totalUSD"], 2)
+
+        inv = discord.Embed(
+            title="Payment Invoice Generated",
+            description="Kindly send the exact amount to the shown LTC address below.",
+            color=0x1A1A2E,
+        )
+        inv.set_author(
+            name="Litecoin Payment",
+            icon_url="https://cryptologos.cc/logos/litecoin-ltc-logo.png",
+        )
+        inv.set_thumbnail(url=INFO_IMAGE_URL)
+
+        if addr:
+            inv.add_field(name="• LTC Wallet Address", value=f"```\n{addr}\n```", inline=False)
+        inv.add_field(name="• Amount to Pay (LTC)", value=f"```\n{amt}\n```", inline=False)
+        inv.add_field(name="• Equivalent in USD",   value=f"```\n${usd}\n```", inline=False)
+        inv.add_field(
+            name="\u200b",
+            value="ℹ️ *Double check the amount. Payments are irreversible.*",
+            inline=False,
+        )
+        inv.set_footer(text=f"Order ID: {self.order_id}")
+        await db_update_order(self.order_id, {
+            "invoiceSentAt": datetime.utcnow().isoformat(),
+            "status":        "awaiting_confirmation",
+        })
+
+        inv_view = PaymentInvoiceView(self.order_id)
+        if pay_link:
+            inv_view.add_item(discord.ui.Button(
+                label="🌐 Open Payment Page",
+                style=discord.ButtonStyle.link,
+                url=pay_link,
+                row=1,
+            ))
+        await interaction.channel.send(embed=inv, view=inv_view)
+
+        channel_id = order.get("channelId")
+        channel    = interaction.guild.get_channel(int(channel_id)) if channel_id else interaction.channel
+        asyncio.create_task(poll_apirone_payment(self.order_id, channel, interaction.user))
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        if not order or order["userId"] != str(interaction.user.id):
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return
+        await db_update_order(self.order_id, {"status": "cancelled"})
+        await send_log(discord.Embed(
+            title="🚫  Order Cancelled",
+            description=f"Order: `{self.order_id}` | User: {interaction.user.mention}",
+            color=0xE74C3C,
+        ))
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="❌  Order Cancelled", color=0xE74C3C),
+            view=None,
+        )
+        channel_id = order.get("channelId")
+        ch = interaction.guild.get_channel(int(channel_id)) if channel_id else None
+        if ch:
+            asyncio.create_task(close_order_channel_cancel(ch, buyer=interaction.user))
+
+
+# ── Payment waiting view (shown after invoice) ────────────────────────────────
+
+class PaymentCheckView(discord.ui.View):
+    """
+    Shown in the order channel after the invoice is sent.
+    Payment is now fully automatic via Plisio IPN webhook.
+    Buyer just needs to send LTC — no TX ID submission required.
+    """
+    def __init__(self, order_id: str):
+        super().__init__(timeout=PAYMENT_TIMEOUT_MIN * 60)
+        self.order_id = order_id
+
+    @discord.ui.button(label="🆘  Request Admin Support", style=discord.ButtonStyle.danger)
+    async def contact_admin_btn(self, interaction: discord.Interaction, _b):
+        await interaction.response.defer()
+        ping = ""
+        if ADMIN_ROLE_ID:
+            role = interaction.guild.get_role(ADMIN_ROLE_ID)
+            ping = role.mention if role else ""
+        await interaction.channel.send(
+            f"{ping} {interaction.user.mention} has requested admin assistance — Order `{self.order_id}`"
+        )
+        await send_log(discord.Embed(
+            title="🆘  Admin Help Requested",
+            description=(
+                f"**User:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                f"**Order:** `{self.order_id}`\n"
+                f"**Channel:** {interaction.channel.mention}"
+            ),
+            color=0xE74C3C,
+        ))
+
+    @discord.ui.button(label="❌ Cancel Order", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        channel_id = order.get("channelId") if order else None
+        channel    = interaction.guild.get_channel(int(channel_id)) if channel_id else interaction.channel
+        if order:
+            await db_update_order(self.order_id, {"status": "cancelled"})
+            await send_log(discord.Embed(
+                title="❌  Order Cancelled",
+                description=(
+                    f"**Order:** `{self.order_id}`\n"
+                    f"**User:** {interaction.user.mention}\n"
+                    f"**Product:** {order.get('categoryName', 'N/A')}"
+                ),
+                color=0xE74C3C,
+            ))
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="❌  Order Cancelled", color=0xE74C3C), view=None
+        )
+        if channel:
+            asyncio.create_task(close_order_channel_cancel(channel, buyer=interaction.user))
+
+
+class PaymentInvoiceView(discord.ui.View):
+    def __init__(self, order_id: str):
+        super().__init__(timeout=PAYMENT_TIMEOUT_MIN * 60)
+        self.order_id = order_id
+
+    @discord.ui.button(label="📋  Paste Ltc Address", style=discord.ButtonStyle.primary)
+    async def paste_details(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        if not order:
+            await interaction.response.send_message("No order was found with that ID. Please verify and try again.", ephemeral=True)
+            return
+        addr = order.get("ltcAddress") or LTC_WALLET_ADDRESS
+        amt  = order["ltcAmount"]
+        usd  = f"${order['totalUSD']:.2f}"
+        await interaction.response.defer()
+        # Send plain messages — easy to tap and copy on mobile
+        await interaction.channel.send(addr)
+        await interaction.channel.send(str(amt))
+        await interaction.channel.send(usd)
+
+    @discord.ui.button(label="◼️  QR Code", style=discord.ButtonStyle.secondary)
+    async def qr_code(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        if not order:
+            await interaction.response.send_message("No order was found with that ID. Please verify and try again.", ephemeral=True)
+            return
+        addr     = order.get("ltcAddress") or ""
+        pay_link = order.get("payLink") or ""
+        amt      = order["ltcAmount"]
+        qr_data  = f"litecoin:{addr}?amount={amt}" if addr else pay_link
+        qr       = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={qr_data}"
+        emb = discord.Embed(
+            title="Scan to Pay",
+            description="Scan with your Litecoin wallet app.",
+            color=0x1A1A2E,
+        )
+        emb.set_author(
+            name="Litecoin QR Code",
+            icon_url="https://cryptologos.cc/logos/litecoin-ltc-logo.png",
+        )
+        emb.set_thumbnail(url=INFO_IMAGE_URL)
+        emb.set_image(url=qr)
+        emb.add_field(name="• Amount (LTC)", value=f"```\n{amt}\n```", inline=False)
+        emb.set_footer(text="This address is unique to your order — do not share it.")
+        await interaction.response.send_message(embed=emb, ephemeral=True)
+
+    @discord.ui.button(label="🚫  Cancel Ticket", style=discord.ButtonStyle.danger)
+    async def cancel_ticket(self, interaction: discord.Interaction, _b):
+        order = await db_get_order(self.order_id)
+        if not order or order["userId"] != str(interaction.user.id):
+            await interaction.response.send_message("This order does not belong to your account.", ephemeral=True)
+            return
+        await db_update_order(self.order_id, {"status": "cancelled"})
+        await send_log(discord.Embed(
+            title="🚫  Order Cancelled",
+            description=f"Order: `{self.order_id}` | User: {interaction.user.mention}",
+            color=0xE74C3C,
+        ))
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="Ticket Cancelled", color=0xE74C3C),
+            view=None,
+        )
+        channel_id = order.get("channelId")
+        ch = interaction.guild.get_channel(int(channel_id)) if channel_id else None
+        if ch:
+            asyncio.create_task(close_order_channel_cancel(ch, buyer=interaction.user))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOT + COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+def get_prefix(bot, message):
+    return ["&", "/"]
+
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+
+
+def is_admin(ctx: commands.Context) -> bool:
+    if ADMIN_ROLE_ID == 0:
+        return ctx.author.guild_permissions.administrator
+    role = ctx.guild.get_role(ADMIN_ROLE_ID)
+    return (role in ctx.author.roles) if role else False
+
+
+bot_start_time = None
+
+@bot.event
+async def on_ready():
+    global bot_start_time, LTC_WALLET_ADDRESS, PAYMENT_TIMEOUT_MIN
+    bot_start_time = datetime.utcnow()
+    bot.add_view(PanelView())  # persistent — survives bot restart
+    bot.add_view(OrderFinalizedView())  # persistent — Order Finalized card buttons
+    # Load any DB overrides for wallet address and timeout
+    addr_override = await get_setting("ltc_wallet_override")
+    if addr_override:
+        LTC_WALLET_ADDRESS = addr_override
+    timeout_override = await get_setting("payment_timeout")
+    if timeout_override and timeout_override.isdigit():
+        PAYMENT_TIMEOUT_MIN = int(timeout_override)
+    # Register PanelView so button interactions work after restart
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.watching, name="&help | LTC Shop")
+    )
+    print(f"✅  {bot.user} online  |  DB: {DB_NAME}  |  Dev mode: {LTC_DEV_MODE}")
+    # Ensure group slugs are unique at the DB layer (guards against race conditions
+    # between concurrent &creategroup/&renamegroup calls)
+    try:
+        await col_groups.create_index("slug", unique=True)
+    except Exception as e:
+        print(f"[startup] Could not ensure unique index on groups.slug: {e}")
+    # Auto-resume any in-progress payments from before the restart
+    for guild in bot.guilds:
+        asyncio.create_task(auto_resume_on_ready(guild))
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"❌ Missing: `{error.param.name}`. Use `&help` for usage.")
+        return
+    print(f"[error] {error}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &panel
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="panel")
+async def cmd_panel(ctx: commands.Context):
+    """Send the shop panel with live stats and product dropdown. Admin only."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    embed     = await build_panel_embed()
+    panel_msg = await ctx.channel.send(embed=embed, view=PanelView())
+    await set_setting("panel_message_id", str(panel_msg.id))
+    await set_setting("panel_channel_id",  str(ctx.channel.id))
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &updatepanel <message_id>
+#  Refresh the panel embed stats (stock counts etc.) in-place
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="updatepanel")
+async def cmd_updatepanel(ctx: commands.Context, message_id: int = None):
+    """Admin: Refresh panel embed stats in-place."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    try:
+        if message_id:
+            msg = await ctx.channel.fetch_message(message_id)
+        else:
+            msg = None
+            async for m in ctx.channel.history(limit=50):
+                if m.author == bot.user and m.embeds:
+                    msg = m
+                    break
+            if not msg:
+                await ctx.reply("❌ Couldn't find a panel message in this channel.")
+                return
+        await msg.edit(embed=await build_panel_embed(), view=PanelView())
+        await set_setting("panel_message_id", str(msg.id))
+        await set_setting("panel_channel_id",  str(ctx.channel.id))
+        await ctx.reply("✅ Panel updated.", delete_after=5)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+    except discord.NotFound:
+        await ctx.reply("❌ Message not found.")
+    except Exception as e:
+        await ctx.reply(f"❌ Failed to update: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &shopname <name>   — set the shop display name
+#  &shopbanner <url>  — set the panel banner image URL
+#  &shopicon <url>    — set the product card thumbnail icon URL
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bot.command(name="shopname")
+async def cmd_shopname(ctx: commands.Context, *, name: str):
+    """
+    Admin: Set the shop name shown in the panel header and footer.
+
+    Usage:
+      &shopname Blinkit Mart
+      &shopname My AutoBuy Store
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    if len(name) > 50:
+        await ctx.reply("❌ Shop name must be 50 characters or fewer.")
+        return
+
+    old_name = await get_setting("shop_name")
+    await set_setting("shop_name", name)
+
+    embed = discord.Embed(title="✅  Shop Name Updated", color=0x7B2FBE)
+    embed.add_field(name="Old Name", value=old_name or "*(not set)*", inline=True)
+    embed.add_field(name="New Name", value=name,                      inline=True)
+    embed.set_footer(text="Run &updatepanel to refresh the panel.")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="⚙️  Shop Name Changed",
+        description=f"**{old_name}** → **{name}** by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+
+
+@bot.command(name="shopbanner")
+async def cmd_shopbanner(ctx: commands.Context, *, url: str = None):
+    """
+    Admin: Set (or clear) the panel banner image.
+
+    Usage:
+      &shopbanner https://i.imgur.com/yourimage.png   — set banner
+      &shopbanner clear                                — remove banner
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    # Allow clearing
+    if not url or url.lower() == "clear":
+        await set_setting("banner_url", "")
+        await ctx.reply("✅ Banner cleared. Run `&updatepanel` to refresh the panel.")
+        return
+
+    # Basic URL check
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await ctx.reply("❌ Please provide a valid image URL starting with `https://`.")
+        return
+
+    await set_setting("banner_url", url)
+
+    embed = discord.Embed(title="✅  Shop Banner Updated", color=0x7B2FBE)
+    embed.set_image(url=url)
+    embed.set_footer(text="Run &updatepanel to refresh the panel.")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="⚙️  Banner Changed",
+        description=f"New banner set by {ctx.author.mention}\n{url}",
+        color=0x9B59B6,
+    ))
+
+
+@bot.command(name="shopicon")
+async def cmd_shopicon(ctx: commands.Context, *, url: str = None):
+    """
+    Admin: Set (or clear) the shop icon shown as thumbnail on product cards.
+
+    Usage:
+      &shopicon https://i.imgur.com/youricon.png   — set icon
+      &shopicon clear                               — remove icon
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    if not url or url.lower() == "clear":
+        await set_setting("icon_url", "")
+        await ctx.reply("✅ Shop icon cleared.")
+        return
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await ctx.reply("❌ Please provide a valid image URL starting with `https://`.")
+        return
+
+    await set_setting("icon_url", url)
+
+    embed = discord.Embed(title="✅  Shop Icon Updated", color=0x7B2FBE)
+    embed.set_thumbnail(url=url)
+    embed.set_footer(text="Changes appear instantly on new product cards.")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="⚙️  Icon Changed",
+        description=f"New icon set by {ctx.author.mention}\n{url}",
+        color=0x9B59B6,
+    ))
+
+
+@bot.command(name="shopsettings")
+async def cmd_shopsettings(ctx: commands.Context):
+    """Admin: View all current shop display settings."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    shop_name    = await get_setting("shop_name")
+    banner_url   = await get_setting("banner_url")
+    icon_url     = await get_setting("icon_url")
+    order_banner = await get_setting("order_banner_url")
+
+    embed = discord.Embed(title="⚙️  Shop Settings", color=0x9B59B6)
+    embed.add_field(name="🏪 Shop Name",      value=shop_name or "*(default)*",                       inline=False)
+    embed.add_field(name="🖼️ Panel Banner",   value=banner_url or "*(not set)*",                     inline=False)
+    embed.add_field(name="🔷 Shop Icon",      value=icon_url or "*(not set)*",                        inline=False)
+    embed.add_field(name="✅ Order Banner",   value=order_banner or "*(not set — no image on orders)*", inline=False)
+    embed.set_footer(text="&shopname / &shopbanner / &shopicon / &orderbanner to change")
+
+    if order_banner:
+        embed.set_image(url=order_banner)
+    elif banner_url:
+        embed.set_image(url=banner_url)
+    if icon_url:
+        embed.set_thumbnail(url=icon_url)
+
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &orderbanner <url | clear>
+#  Set the banner image shown on Order Completed messages in the sales channel
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="orderbanner")
+async def cmd_orderbanner(ctx: commands.Context, *, url: str = None):
+    """
+    Admin: Set the banner image shown on Order Completed cards in the sales channel.
+
+    Usage:
+      &orderbanner https://i.imgur.com/yourimage.png   — set banner
+      &orderbanner clear                                — remove banner
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    if not url or url.lower() == "clear":
+        await set_setting("order_banner_url", "")
+        await ctx.reply("✅ Order completed banner cleared.")
+        return
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await ctx.reply("❌ Please provide a valid image URL starting with `https://`.")
+        return
+
+    await set_setting("order_banner_url", url)
+
+    embed = discord.Embed(
+        title="✅  Order Banner Updated",
+        description="This image will appear at the bottom of every Order Completed card.",
+        color=0x7B2FBE,
+    )
+    embed.set_image(url=url)
+    embed.set_footer(text="Takes effect immediately on the next completed order.")
+    await ctx.reply(embed=embed)
+
+    await send_log(discord.Embed(
+        title="⚙️  Order Banner Changed",
+        description=f"New order banner set by {ctx.author.mention}\n{url}",
+        color=0x9B59B6,
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &stock [category]
+#  Shows all categories, or a single category if name is given
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="stock")
+async def cmd_stock(ctx: commands.Context, *, category: str = None):
+    """
+    &stock              → list all categories with stock counts
+    &stock <name>       → show one specific category's stock
+    """
+    if category:
+        cat = await db_find_category(category)
+        if not cat:
+            await ctx.reply(f"❌ No category matching `{category}`. Use `&stock` to list all.")
+            return
+
+        count = len(cat.get("stock", []))
+        badge = ("🔴 Out of Stock"         if count == 0 else
+                 f"🟡 Low — {count} left"  if count <= 3 else
+                 f"🟢 {count} in stock")
+
+        embed = discord.Embed(title=f"📦  {cat['name']}", color=0x7B2FBE)
+        embed.add_field(name="💵 Price", value=f"${cat['price_usd']:.2f} USD", inline=True)
+        embed.add_field(name="📊 Stock", value=badge,                          inline=True)
+        if cat.get("description"):
+            embed.add_field(name="📝 Description", value=cat["description"],   inline=False)
+        if cat.get("instruction"):
+            embed.add_field(name="📌 Instruction", value=cat["instruction"],   inline=False)
+        embed.set_footer(text=f"Slug: {cat['slug']}  •  Use &restock {cat['slug']} to add stock")
+        await ctx.reply(embed=embed)
+
+    else:
+        cats = await db_get_categories()
+        if not cats:
+            await ctx.reply("❌ No categories yet. Use `&category <n> <price>` to create one.")
+            return
+
+        embed = discord.Embed(title="📦  All Stock", color=0x7B2FBE)
+        embed.set_footer(text="&stock <name> for details  •  &panel to open the shop")
+
+        for c in cats:
+            is_infinite = bool(c.get("infinite_stock"))
+            count = len(c.get("stock", [])) if not is_infinite else 9999
+            if is_infinite:
+                badge = "♾️ Infinite (unlimited)"
+            elif count == 0:
+                badge = "🔴 Out of Stock"
+            elif count <= 3:
+                badge = f"🟡 {count} left (low!)"
+            else:
+                badge = f"🟢 {count} in stock"
+            embed.add_field(
+                name=c["name"],
+                value=f"💵 ${c['price_usd']:.2f} USD  •  {badge}",
+                inline=False,
+            )
+        await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &category <name> <price> [instruction]
+#  Creates a new product category
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="category")
+async def cmd_category(ctx: commands.Context, name: str, price: str, *, instruction: str = ""):
+    """
+    Admin: Create a new product category.
+
+    Usage
+    ─────
+    &category "Netflix 1 Month" 5.99
+    &category Spotify 3.99 Login at spotify.com with the credentials below.
+
+    name        — wrap in quotes if it has spaces
+    price       — USD price per unit
+    instruction — optional text shown to buyer after they receive their items
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    try:
+        price_val = float(price)
+        if price_val <= 0:
+            raise ValueError
+    except ValueError:
+        await ctx.reply('❌ Invalid price. Usage: `&category "Name" 5.99 [instruction]`')
+        return
+
+    slug = slugify(name)
+    if await db_get_category(slug):
+        await ctx.reply(
+            f"❌ Category **{name}** already exists.\n"
+            f"Use `&restock {slug}` (with a .txt attachment) to add stock."
+        )
+        return
+
+    cat = await db_create_category(name=name, price=price_val, instruction=instruction)
+
+    embed = discord.Embed(title="✅  Category Created", color=0x7B2FBE)
+    embed.add_field(name="Name",  value=cat["name"],                  inline=True)
+    embed.add_field(name="Slug",  value=f"`{cat['slug']}`",           inline=True)
+    embed.add_field(name="Price", value=f"${cat['price_usd']:.2f} USD", inline=True)
+    if instruction:
+        embed.add_field(name="📌 Instruction", value=instruction,     inline=False)
+    embed.set_footer(text=f"Next step: &restock {cat['slug']}  (attach a .txt file with one item per line)")
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &restock <category>  [attach a .txt file]
+#  Reads the attached file line-by-line and pushes each line as a stock item
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="restock")
+async def cmd_restock(ctx: commands.Context, *, category: str):
+    """
+    Admin: Bulk-add stock from an attached .txt file.
+    One stock item per line in the file.
+
+    Usage
+    ─────
+    &restock netflix-1-month        ← slug
+    &restock "Netflix 1 Month"      ← name also works
+
+    File format (stock.txt)
+    ───────────────────────
+    user1@email.com:password1
+    user2@email.com:password2
+    GIFT-KEY-XXXX-YYYY
+    https://gift-link.example/abc
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(
+            f"❌ No category matching `{category}`.\n"
+            f"Use `&stock` to list all, or `&category` to create one."
+        )
+        return
+
+    if not ctx.message.attachments:
+        await ctx.reply(
+            f"❌ No file attached.\n\n"
+            f"Attach a `.txt` file with **one item per line**, then run:\n"
+            f"```&restock {cat['slug']}```"
+        )
+        return
+
+    attachment = ctx.message.attachments[0]
+
+    if not attachment.filename.lower().endswith(".txt"):
+        await ctx.reply("❌ Only `.txt` files are accepted.")
+        return
+
+    if attachment.size > 5_000_000:   # 5 MB cap
+        await ctx.reply("❌ File too large (max 5 MB).")
+        return
+
+    try:
+        raw   = await attachment.read()
+        text  = raw.decode("utf-8", errors="replace")
+    except Exception as e:
+        await ctx.reply(f"❌ Could not read file: {e}")
+        return
+
+    all_lines  = [line.strip() for line in text.splitlines()]
+    items      = [l for l in all_lines if l]   # drop blank lines
+
+    if not items:
+        await ctx.reply("❌ The file is empty or has only blank lines.")
+        return
+
+    added   = await db_restock(cat["slug"], items)
+    updated = await db_get_category(cat["slug"])
+    total   = len(updated.get("stock", []))
+    skipped = len(items) - added
+
+    embed = discord.Embed(title="📦  Restock Complete", color=0x7B2FBE)
+    embed.add_field(name="Category",       value=cat["name"],        inline=True)
+    embed.add_field(name="File",           value=attachment.filename, inline=True)
+    embed.add_field(name="\u200b",         value="\u200b",           inline=True)
+    embed.add_field(name="📄 Lines in file", value=str(len(items)),  inline=True)
+    embed.add_field(name="✅ Added",        value=str(added),         inline=True)
+    embed.add_field(name="⏭️ Skipped",      value=f"{skipped} (duplicates)", inline=True)
+    embed.add_field(name="📊 New Total",    value=f"**{total}** in stock", inline=False)
+    embed.set_footer(text=f"Slug: {cat['slug']}")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &orders
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="orders")
+async def cmd_orders(ctx: commands.Context, limit: int = 10):
+    """(Admin) View recent orders. &orders 25 shows last 25."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    limit  = max(1, min(limit, 50))  # clamp 1-50
+    recent = await db_recent_orders(limit)
+    if not recent:
+        await ctx.reply("No orders yet.")
+        return
+    icons = {"pending": "🟡", "awaiting_confirmation": "🔵", "delivered": "🟢",
+             "cancelled": "🔴", "expired": "⚫", "error": "🟠"}
+    embed = discord.Embed(title="📋  Recent Orders (Last 10)", color=0x9B59B6)
+    for o in recent:
+        embed.add_field(
+            name=f"{icons.get(o['status'], '⚪')} {o['orderId']}",
+            value=(
+                f"<@{o['userId']}> • {o['categoryName']}\n"
+                f"Qty: {o['quantity']} • {o['ltcAmount']} LTC • **{o['status']}**"
+            ),
+            inline=False,
+        )
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &deleteorder
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="deleteorder")
+async def cmd_deleteorder(ctx: commands.Context):
+    """
+    Admin: Delete completed order channels + channels inactive for 1+ hour.
+    Leaves channels with active orders (pending / awaiting_confirmation) untouched.
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    # ── Confirmation step ─────────────────────────────────────────────────────
+    confirm_embed = discord.Embed(
+        title="⚠️  Confirm Bulk Delete",
+        description=(
+            "This will delete **all completed/inactive order channels**.\n"
+            "Active orders are safe. Type `confirm` to proceed or `cancel` to abort."
+        ),
+        color=0xA855F7,
+    )
+    await ctx.reply(embed=confirm_embed)
+
+    def _check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("confirm", "cancel")
+
+    try:
+        reply = await bot.wait_for("message", check=_check, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.reply("⏰ Timed out — operation cancelled.")
+        return
+
+    if reply.content.lower() == "cancel":
+        await ctx.reply("✅ Cancelled.")
+        return
+
+    status_msg = await ctx.reply("🔍 Scanning order channels...")
+
+    if not ORDER_CATEGORY_ID:
+        await status_msg.edit(content="❌ `ORDER_CATEGORY_ID` env var not set.")
+        return
+
+    category = ctx.guild.get_channel(ORDER_CATEGORY_ID)
+    if not category or not isinstance(category, discord.CategoryChannel):
+        await status_msg.edit(content="❌ Order category not found. Check `ORDER_CATEGORY_ID`.")
+        return
+
+    deleted = []
+    skipped = []
+    now     = datetime.utcnow()
+
+    for ch in category.channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+
+
+        # ── Safety guard: only touch channels the bot created ─────────────────
+        # Bot creates channels as 'order-<id>-<name>' and renames to 'closed-<id>-<name>'.
+        # Anything else is silently ignored — no need to show in the report.
+        if not (ch.name.startswith("order-") or ch.name.startswith("closed-")):
+            continue  # silent skip — not a bot-created channel
+
+        order = await col_orders.find_one({"channelId": str(ch.id)}, {"_id": 0})
+
+        if order:
+            status = order.get("status", "")
+            if status in ("pending", "awaiting_confirmation"):
+                skipped.append(f"🔵 #{ch.name} — active ({status})")
+                continue
+            reason = f"Order {status}"
+        else:
+            try:
+                last_msg = None
+                async for m in ch.history(limit=1):
+                    last_msg = m
+                if last_msg:
+                    age = (now - last_msg.created_at.replace(tzinfo=None)).total_seconds()
+                    if age < 3600:
+                        skipped.append(f"⏳ #{ch.name} — active {int(age//60)}m ago")
+                        continue
+                reason = "No order + inactive 1h+"
+            except Exception:
+                skipped.append(f"⚠️ #{ch.name} — could not check")
+                continue
+
+        try:
+            await ch.delete(reason=f"&deleteorder — {reason}")
+            deleted.append(f"🗑️ #{ch.name}")
+        except Exception as e:
+            skipped.append(f"⚠️ #{ch.name} — delete failed: {e}")
+
+    embed = discord.Embed(title="🗑️  Order Channel Cleanup", color=0xE74C3C)
+    embed.add_field(
+        name=f"✅ Deleted ({len(deleted)})",
+        value=("\n".join(deleted[:20]) + ("\n..." if len(deleted) > 20 else "")) or "Nothing to delete.",
+        inline=False,
+    )
+    if skipped:
+        embed.add_field(
+            name=f"⏭️ Skipped ({len(skipped)})",
+            value="\n".join(skipped[:10]) + ("\n..." if len(skipped) > 10 else ""),
+            inline=False,
+        )
+    embed.set_footer(text=f"Scanned {len(category.channels)} channels.")
+    await status_msg.edit(content=None, embed=embed)
+    await send_log(discord.Embed(
+        title="🗑️  Order Channel Cleanup",
+        description=f"{len(deleted)} channels deleted by {ctx.author.mention}",
+        color=0xE74C3C,
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &categoryrename <old name> | <new name>
+#  Renames a category. Slug is also updated.
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="categoryrename")
+async def cmd_categoryrename(ctx: commands.Context, *, args: str):
+    """
+    Admin: Rename a category.
+
+    Usage:
+      &categoryrename <current name> | <new name>
+
+    Example:
+      &categoryrename Netflix 1 Month | Netflix Premium 1M
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    if "|" not in args:
+        await ctx.reply('❌ Separate old and new names with `|`\nExample: `&categoryrename Netflix 1 Month | Netflix Premium 1M`')
+        return
+
+    parts    = args.split("|", 1)
+    old_name = parts[0].strip()
+    new_name = parts[1].strip()
+
+    if not old_name or not new_name:
+        await ctx.reply("❌ Both old name and new name are required.")
+        return
+
+    cat = await db_find_category(old_name)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{old_name}`. Use `&stock` to list all.")
+        return
+
+    new_slug = slugify(new_name)
+
+    # Make sure the new slug isn't already taken by a different category
+    existing = await db_get_category(new_slug)
+    if existing and existing["slug"] != cat["slug"]:
+        await ctx.reply(f"❌ A category named **{new_name}** already exists.")
+        return
+
+    old_slug = cat["slug"]
+    old_name_display = cat["name"]
+
+    # Update category
+    await col_cats.update_one(
+        {"slug": old_slug},
+        {"$set": {"name": new_name, "slug": new_slug}}
+    )
+
+    # Update all orders that reference the old slug so history stays consistent
+    await col_orders.update_many(
+        {"categorySlug": old_slug},
+        {"$set": {"categorySlug": new_slug, "categoryName": new_name}}
+    )
+
+    await send_log(discord.Embed(
+        title="✏️  Category Renamed",
+        description=f"**{old_name_display}** → **{new_name}**\nSlug: `{old_slug}` → `{new_slug}`",
+        color=0x9B59B6,
+    ))
+
+    embed = discord.Embed(title="✅  Category Renamed", color=0x7B2FBE)
+    embed.add_field(name="Old Name", value=old_name_display,        inline=True)
+    embed.add_field(name="New Name", value=new_name,                inline=True)
+    embed.add_field(name="New Slug", value=f"`{new_slug}`",         inline=True)
+    embed.set_footer(text="All existing orders updated to match the new name.")
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &removecategory <name>  (alias: &deleteproduct)
+#  Deletes a category/product and all its remaining stock, after confirmation.
+# ─────────────────────────────────────────────────────────────────────────────
+async def _confirm_and_delete_product(ctx: commands.Context, name: str):
+    """Shared confirm-then-delete flow used by &removecategory and &deleteproduct."""
+    cat = await db_find_category(name)
+    if not cat:
+        await ctx.reply(f"❌ No product matching `{name}`. Use `&stock` to list all.")
+        return
+
+    stock_count = len(cat.get("stock", []))
+
+    # ── Confirmation step ─────────────────────────────────────────────────────
+    confirm_embed = discord.Embed(
+        title="⚠️  Confirm Deletion",
+        description=(
+            f"You are about to **permanently delete** product **{cat['name']}** "
+            f"and all **{stock_count}** stock items.\n\n"
+            "This cannot be undone. Type `confirm` to proceed or `cancel` to abort."
+        ),
+        color=0xA855F7,
+    )
+    await ctx.reply(embed=confirm_embed)
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("confirm", "cancel")
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.reply("⏰ Timed out — deletion cancelled.")
+        return
+
+    if reply.content.lower() == "cancel":
+        await ctx.reply("✅ Deletion cancelled.")
+        return
+
+    await db_delete_category(cat["slug"])
+    await send_log(discord.Embed(
+        title="🗑️  Product Removed",
+        description=f"**{cat['name']}** (`{cat['slug']}`) deleted by {ctx.author.mention} — {stock_count} stock items discarded.",
+        color=0xE74C3C,
+    ))
+
+    embed = discord.Embed(title="🗑️  Product Removed", color=0xE74C3C)
+    embed.add_field(name="Name",          value=cat["name"],         inline=True)
+    embed.add_field(name="Slug",          value=f"`{cat['slug']}`",  inline=True)
+    embed.add_field(name="Stock Deleted", value=str(stock_count),    inline=True)
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+@bot.command(name="removecategory")
+async def cmd_removecategory(ctx: commands.Context, *, name: str):
+    """
+    Admin: Delete a category/product and all its remaining stock.
+
+    Usage:
+      &removecategory Netflix 1 Month
+      &removecategory netflix-1-month
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    await _confirm_and_delete_product(ctx, name)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PRODUCT GROUPS  (folders like "Bot Src", "Tools", "Accounts")
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &creategroup <name>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="creategroup")
+async def cmd_creategroup(ctx: commands.Context, *, name: str):
+    """
+    Admin: Create a new product group (folder for organising products).
+
+    Usage:
+      &creategroup Bot Src
+      &creategroup Accounts
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    name = name.strip()
+    if not name:
+        await ctx.reply("❌ Group name cannot be empty. Usage: `&creategroup <name>`")
+        return
+
+    slug = slugify(name)
+    if await db_get_group(slug):
+        await ctx.reply(f"❌ Group **{name}** already exists.")
+        return
+
+    grp = await db_create_group(name)
+    if grp is None:
+        await ctx.reply(f"❌ Group **{name}** already exists.")
+        return
+    embed = discord.Embed(title="✅  Group Created", color=0x7B2FBE)
+    embed.add_field(name="Name", value=grp["name"],        inline=True)
+    embed.add_field(name="Slug", value=f"`{grp['slug']}`", inline=True)
+    embed.set_footer(text=f"Use &addtogroup <product> | {grp['name']} to add products to this group.")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="🗂️  Group Created",
+        description=f"**{grp['name']}** (`{grp['slug']}`) created by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &renamegroup <old name> | <new name>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="renamegroup")
+async def cmd_renamegroup(ctx: commands.Context, *, args: str):
+    """
+    Admin: Rename an existing product group.
+
+    Usage:
+      &renamegroup Tools | Utilities
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    if "|" not in args:
+        await ctx.reply('❌ Separate old and new names with `|`\nExample: `&renamegroup Tools | Utilities`')
+        return
+
+    old_name, new_name = (p.strip() for p in args.split("|", 1))
+    if not old_name or not new_name:
+        await ctx.reply("❌ Both old name and new name are required.")
+        return
+
+    grp = await db_find_group(old_name)
+    if not grp:
+        await ctx.reply(f"❌ No group matching `{old_name}`. Use `&groups` to list all.")
+        return
+
+    new_slug = slugify(new_name)
+    existing = await db_get_group(new_slug)
+    if existing and existing["slug"] != grp["slug"]:
+        await ctx.reply(f"❌ A group named **{new_name}** already exists.")
+        return
+
+    old_slug_display = grp["slug"]
+    new_slug          = await db_rename_group(grp["slug"], new_name)
+    if new_slug is None:
+        await ctx.reply(f"❌ A group named **{new_name}** already exists.")
+        return
+
+    embed = discord.Embed(title="✅  Group Renamed", color=0x7B2FBE)
+    embed.add_field(name="Old Name", value=grp["name"], inline=True)
+    embed.add_field(name="New Name", value=new_name,    inline=True)
+    embed.add_field(name="New Slug", value=f"`{new_slug}`", inline=True)
+    embed.set_footer(text="All products in this group have been updated automatically.")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="✏️  Group Renamed",
+        description=f"**{grp['name']}** → **{new_name}**\nSlug: `{old_slug_display}` → `{new_slug}`\nBy {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &deletegroup <name>
+#  Deletes the group only — products inside are moved to Ungrouped, never deleted.
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="deletegroup")
+async def cmd_deletegroup(ctx: commands.Context, *, name: str):
+    """
+    Admin: Delete a product group. Products inside are moved to Ungrouped
+    (they are never deleted).
+
+    Usage:
+      &deletegroup Tools
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    grp = await db_find_group(name)
+    if not grp:
+        await ctx.reply(f"❌ No group matching `{name}`. Use `&groups` to list all.")
+        return
+
+    products = await db_categories_in_group(grp["slug"])
+
+    confirm_embed = discord.Embed(
+        title="⚠️  Confirm Group Deletion",
+        description=(
+            f"You are about to delete group **{grp['name']}**.\n"
+            f"**{len(products)}** product(s) inside will be moved to *Ungrouped* — they will **not** be deleted.\n\n"
+            "Type `confirm` to proceed or `cancel` to abort."
+        ),
+        color=0xA855F7,
+    )
+    await ctx.reply(embed=confirm_embed)
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("confirm", "cancel")
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.reply("⏰ Timed out — deletion cancelled.")
+        return
+    if reply.content.lower() == "cancel":
+        await ctx.reply("✅ Deletion cancelled.")
+        return
+
+    await col_cats.update_many({"group": grp["slug"]}, {"$set": {"group": None}})
+    await db_delete_group(grp["slug"])
+
+    await send_log(discord.Embed(
+        title="🗑️  Group Deleted",
+        description=f"**{grp['name']}** (`{grp['slug']}`) deleted by {ctx.author.mention} — {len(products)} product(s) moved to Ungrouped.",
+        color=0xE74C3C,
+    ))
+
+    embed = discord.Embed(title="🗑️  Group Deleted", color=0xE74C3C)
+    embed.add_field(name="Name",           value=grp["name"],              inline=True)
+    embed.add_field(name="Products Moved", value=f"{len(products)} → Ungrouped", inline=True)
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &groups  — list all groups with product counts
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="groups")
+async def cmd_groups(ctx: commands.Context):
+    """List all product groups with how many products are inside each one."""
+    groups    = await db_get_groups()
+    ungrouped = await db_categories_in_group(None)
+
+    if not groups and not ungrouped:
+        await ctx.reply("❌ No groups or products yet. Use `&creategroup <name>` to start.")
+        return
+
+    embed = discord.Embed(title="🗂️  Product Groups", color=0x9B59B6)
+    if not groups:
+        embed.description = "No groups created yet. Use `&creategroup <name>` to create one."
+    for g in groups:
+        products = await db_categories_in_group(g["slug"])
+        embed.add_field(
+            name=f"📁 {g['name']}",
+            value=f"`{g['slug']}` • {len(products)} product(s)",
+            inline=False,
+        )
+    if ungrouped:
+        embed.add_field(name="📂 Ungrouped", value=f"{len(ungrouped)} product(s)", inline=False)
+    embed.set_footer(text="&groupproducts <group> to view products  •  &creategroup <name> to add a group")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &groupproducts <group>  — list products inside one group ("ungrouped" works too)
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="groupproducts")
+async def cmd_groupproducts(ctx: commands.Context, *, group: str):
+    """
+    List all products inside a group.
+
+    Usage:
+      &groupproducts Accounts
+      &groupproducts ungrouped
+    """
+    if group.strip().lower() == "ungrouped":
+        products = await db_categories_in_group(None)
+        title    = "📂  Ungrouped Products"
+    else:
+        grp = await db_find_group(group)
+        if not grp:
+            await ctx.reply(f"❌ No group matching `{group}`. Use `&groups` to list all.")
+            return
+        products = await db_categories_in_group(grp["slug"])
+        title    = f"📁  {grp['name']}"
+
+    if not products:
+        await ctx.reply(f"ℹ️ No products in **{title.split(chr(32), 1)[-1].strip()}** yet.")
+        return
+
+    embed = discord.Embed(title=title, color=0x7B2FBE)
+    for p in products:
+        count = "♾️ Infinite" if p.get("infinite_stock") else str(len(p.get("stock", [])))
+        embed.add_field(name=p["name"], value=f"💵 ${p['price_usd']:.2f}  •  📦 {count}  •  `{p['slug']}`", inline=False)
+    embed.set_footer(text=f"{len(products)} product(s)")
+    await ctx.reply(embed=embed)
+
+
+async def _move_product_to_group(ctx: commands.Context, product_query: str, group_query: str):
+    """Shared logic for &addtogroup and &moveproduct."""
+    cat = await db_find_category(product_query)
+    if not cat:
+        await ctx.reply(f"❌ No product matching `{product_query}`. Use `&stock` to list all.")
+        return
+
+    grp = await db_find_group(group_query)
+    if not grp:
+        await ctx.reply(
+            f"❌ No group matching `{group_query}`. Use `&groups` to list all, "
+            f"or `&creategroup {group_query}` to create it first."
+        )
+        return
+
+    old_group_doc = await db_get_group(cat.get("group"))
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"group": grp["slug"]}})
+
+    embed = discord.Embed(title="✅  Product Moved", color=0x7B2FBE)
+    embed.add_field(name="Product", value=cat["name"],                                      inline=True)
+    embed.add_field(name="From",    value=old_group_doc["name"] if old_group_doc else "Ungrouped", inline=True)
+    embed.add_field(name="To",      value=grp["name"],                                       inline=True)
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="📦  Product Moved Between Groups",
+        description=f"**{cat['name']}** → **{grp['name']}**  (by {ctx.author.mention})",
+        color=0x9B59B6,
+    ))
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &addtogroup <product> | <group>  (alias: &moveproduct)
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="addtogroup")
+async def cmd_addtogroup(ctx: commands.Context, *, args: str):
+    """
+    Admin: Add (or move) a product into a group.
+
+    Usage:
+      &addtogroup Netflix 1 Month | Accounts
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if "|" not in args:
+        await ctx.reply('❌ Separate product and group with `|`\nExample: `&addtogroup Netflix 1 Month | Accounts`')
+        return
+    product_q, group_q = (p.strip() for p in args.split("|", 1))
+    if not product_q or not group_q:
+        await ctx.reply("❌ Both product and group are required.")
+        return
+    await _move_product_to_group(ctx, product_q, group_q)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &moveproduct <product> | <group>  — same as &addtogroup, explicit naming
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="moveproduct")
+async def cmd_moveproduct(ctx: commands.Context, *, args: str):
+    """
+    Admin: Move a product to a different group.
+
+    Usage:
+      &moveproduct Netflix 1 Month | Bot Src
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if "|" not in args:
+        await ctx.reply('❌ Separate product and group with `|`\nExample: `&moveproduct Netflix 1 Month | Bot Src`')
+        return
+    product_q, group_q = (p.strip() for p in args.split("|", 1))
+    if not product_q or not group_q:
+        await ctx.reply("❌ Both product and group are required.")
+        return
+    await _move_product_to_group(ctx, product_q, group_q)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &removefromgroup <product>  — unassign a product, moves it to Ungrouped
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="removefromgroup")
+async def cmd_removefromgroup(ctx: commands.Context, *, product: str):
+    """
+    Admin: Remove a product from its group (moves it to Ungrouped).
+
+    Usage:
+      &removefromgroup Netflix 1 Month
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(product)
+    if not cat:
+        await ctx.reply(f"❌ No product matching `{product}`. Use `&stock` to list all.")
+        return
+    if not cat.get("group"):
+        await ctx.reply(f"ℹ️ **{cat['name']}** is already Ungrouped.")
+        return
+
+    old_group_doc = await db_get_group(cat["group"])
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"group": None}})
+    await ctx.reply(embed=discord.Embed(
+        title="✅  Removed From Group",
+        description=f"**{cat['name']}** is now **Ungrouped** (was in **{old_group_doc['name'] if old_group_doc else 'Unknown'}**).",
+        color=0x7B2FBE,
+    ))
+    await send_log(discord.Embed(
+        title="📦  Product Removed From Group",
+        description=f"**{cat['name']}** removed from **{old_group_doc['name'] if old_group_doc else 'Unknown'}** by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    asyncio.create_task(auto_update_panel())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADDITIONAL PRODUCT MANAGEMENT COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &searchproduct <query>  — search products by name/description
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="searchproduct")
+async def cmd_searchproduct(ctx: commands.Context, *, query: str):
+    """
+    Search for products by name or description.
+
+    Usage:
+      &searchproduct netflix
+    """
+    query_l = query.strip().lower()
+    if not query_l:
+        await ctx.reply("❌ Enter a search term. Usage: `&searchproduct netflix`")
+        return
+
+    cats = await db_get_categories()
+    matches = [
+        c for c in cats
+        if query_l in c["name"].lower() or query_l in (c.get("description") or "").lower()
+    ]
+    if not matches:
+        await ctx.reply(f"❌ No products matching `{query}`.")
+        return
+
+    embed = discord.Embed(title=f"🔎  Search Results — \"{query}\"", color=0x9B59B6)
+    for c in matches[:20]:
+        count = "♾️ Infinite" if c.get("infinite_stock") else str(len(c.get("stock", [])))
+        embed.add_field(
+            name=c["name"],
+            value=f"💵 ${c['price_usd']:.2f}  •  📦 {count}  •  `{c['slug']}`",
+            inline=False,
+        )
+    footer = f"{len(matches)} match(es)"
+    if len(matches) > 20:
+        footer += " — showing first 20"
+    embed.set_footer(text=footer)
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &productinfo <product>  — full detail card for one product
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="productinfo")
+async def cmd_productinfo(ctx: commands.Context, *, product: str):
+    """
+    View full details for a single product: group, price, stock, min quantity,
+    custom LTC destination, description, instructions and ToC status.
+
+    Usage:
+      &productinfo Netflix 1 Month
+    """
+    cat = await db_find_category(product)
+    if not cat:
+        await ctx.reply(f"❌ No product matching `{product}`. Use `&stock` to list all.")
+        return
+
+    grp          = await db_get_group(cat.get("group"))
+    is_infinite  = bool(cat.get("infinite_stock"))
+    stock_display = "♾️ Infinite" if is_infinite else str(len(cat.get("stock", [])))
+    toc          = await get_toc(cat["slug"])
+
+    embed = discord.Embed(title=f"ℹ️  {cat['name']}", color=0x7B2FBE)
+    embed.add_field(name="Slug",     value=f"`{cat['slug']}`",                inline=True)
+    embed.add_field(name="Group",    value=grp["name"] if grp else "Ungrouped", inline=True)
+    embed.add_field(name="Price",    value=f"${cat['price_usd']:.2f} USD",     inline=True)
+    embed.add_field(name="Stock",    value=stock_display,                     inline=True)
+    embed.add_field(name="Min Qty",  value=str(cat.get("min_quantity", 1)),    inline=True)
+    embed.add_field(
+        name="Custom LTC Dest",
+        value=f"`{cat['custom_ltc_dest']}`" if cat.get("custom_ltc_dest") else "None (uses master wallet)",
+        inline=True,
+    )
+    if cat.get("description"):
+        embed.add_field(name="Description", value=cat["description"], inline=False)
+    if cat.get("instruction"):
+        embed.add_field(name="Post-Delivery Instructions", value=cat["instruction"], inline=False)
+    embed.add_field(name="Terms & Conditions", value="✅ Set" if toc else "❌ Not set", inline=True)
+    embed.set_footer(text=f"Created: {cat.get('createdAt', 'unknown')[:10]}")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &editproduct <product> | <field> | <value>
+#  Fields: name, price, description, instruction, minqty
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="editproduct")
+async def cmd_editproduct(ctx: commands.Context, *, args: str):
+    """
+    Admin: Edit a product's name, price, description, instruction or minimum quantity.
+
+    Usage:
+      &editproduct <product> | <field> | <new value>
+      Fields: name, price, description, instruction, minqty
+
+    Example:
+      &editproduct Netflix 1 Month | price | 6.99
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) != 3 or not all(parts):
+        await ctx.reply(
+            '❌ Usage: `&editproduct <product> | <field> | <new value>`\n'
+            'Fields: `name`, `price`, `description`, `instruction`, `minqty`'
+        )
+        return
+
+    product_q, field, value = parts
+    field = field.lower()
+
+    cat = await db_find_category(product_q)
+    if not cat:
+        await ctx.reply(f"❌ No product matching `{product_q}`. Use `&stock` to list all.")
+        return
+
+    if field == "name":
+        new_slug = slugify(value)
+        existing = await db_get_category(new_slug)
+        if existing and existing["slug"] != cat["slug"]:
+            await ctx.reply(f"❌ A product named **{value}** already exists.")
+            return
+        await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"name": value, "slug": new_slug}})
+        await col_orders.update_many({"categorySlug": cat["slug"]}, {"$set": {"categorySlug": new_slug, "categoryName": value}})
+        await col_toc.update_one({"slug": cat["slug"]}, {"$set": {"slug": new_slug}})
+        result_desc = f"Name changed: **{cat['name']}** → **{value}**"
+
+    elif field == "price":
+        try:
+            price_val = float(value)
+            if price_val <= 0:
+                raise ValueError
+        except ValueError:
+            await ctx.reply("❌ Invalid price. Must be a positive number, e.g. `5.99`.")
+            return
+        await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"price_usd": price_val}})
+        result_desc = f"Price changed: ${cat['price_usd']:.2f} → ${price_val:.2f}"
+
+    elif field == "description":
+        await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"description": value}})
+        result_desc = "Description updated."
+
+    elif field == "instruction":
+        await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"instruction": value}})
+        result_desc = "Post-delivery instruction updated."
+
+    elif field in ("minqty", "min_quantity"):
+        try:
+            minimum = int(value)
+            if minimum < 1:
+                raise ValueError
+        except ValueError:
+            await ctx.reply("❌ Minimum quantity must be a whole number ≥ 1.")
+            return
+        await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"min_quantity": minimum}})
+        result_desc = f"Minimum quantity set to {minimum}."
+
+    else:
+        await ctx.reply(f"❌ Unknown field `{field}`. Valid fields: `name`, `price`, `description`, `instruction`, `minqty`.")
+        return
+
+    await send_log(discord.Embed(
+        title="✏️  Product Edited",
+        description=f"**{cat['name']}** — {result_desc}\nEdited by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    embed = discord.Embed(title="✅  Product Updated", description=result_desc, color=0x7B2FBE)
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &deleteproduct <name>  — alias for &removecategory
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="deleteproduct")
+async def cmd_deleteproduct(ctx: commands.Context, *, name: str):
+    """
+    Admin: Delete a product and all its remaining stock. Same as &removecategory.
+
+    Usage:
+      &deleteproduct Netflix 1 Month
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    await _confirm_and_delete_product(ctx, name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &removestock <category>
+#  Wipes ALL stock from a category without deleting the category itself
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="removestock")
+async def cmd_removestock(ctx: commands.Context, *, category: str):
+    """
+    Admin: Clear all stock from a category (keeps the category, just empties it).
+
+    Usage:
+      &removestock Netflix 1 Month
+      &removestock netflix-1-month
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`. Use `&stock` to list all.")
+        return
+
+    stock_count = len(cat.get("stock", []))
+
+    if stock_count == 0:
+        await ctx.reply(f"ℹ️ **{cat['name']}** is already empty — nothing to remove.")
+        return
+
+    # Wipe the stock array
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"stock": []}})
+
+    await send_log(discord.Embed(
+        title="🧹  Stock Cleared",
+        description=f"**{cat['name']}** (`{cat['slug']}`) — {stock_count} items removed.",
+        color=0xA855F7,
+    ))
+
+    embed = discord.Embed(title="🧹  Stock Cleared", color=0xA855F7)
+    embed.add_field(name="Category",      value=cat["name"],        inline=True)
+    embed.add_field(name="Items Removed", value=str(stock_count),   inline=True)
+    embed.add_field(name="Stock Now",     value="0 (empty)",        inline=True)
+    embed.set_footer(text=f"Category still exists — use &restock {cat['slug']} to add new stock.")
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &toc <category> <message>    — set ToC for a category
+#  &toc <category> clear        — remove ToC for a category
+#  &toc <category>              — view current ToC for a category
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="toc")
+async def cmd_toc(ctx: commands.Context, category: str, *, message: str = None):
+    """
+    Admin: Set, view, or clear the Terms & Conditions for a category.
+    Users must accept the ToC before they can purchase.
+
+    Usage:
+      &toc "Netflix 1M" By purchasing you agree that all sales are final.
+      &toc netflix-1-month clear    — remove the ToC
+      &toc netflix-1-month          — view the current ToC
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`. Use `&stock` to list all.")
+        return
+
+    # ── View current ToC ──────────────────────────────────────────────────────
+    if not message:
+        current = await get_toc(cat["slug"])
+        embed = discord.Embed(title=f"📜  ToC — {cat['name']}", color=0xA855F7)
+        embed.add_field(
+            name="Current Terms & Conditions",
+            value=current or "*(No ToC set — buyers go straight to purchase)*",
+            inline=False,
+        )
+        embed.set_footer(text=f"&toc '{cat['name']}' <message> to set  •  &toc '{cat['name']}' clear to remove")
+        await ctx.reply(embed=embed)
+        return
+
+    # ── Clear ToC ─────────────────────────────────────────────────────────────
+    if message.strip().lower() == "clear":
+        await clear_toc(cat["slug"])
+        embed = discord.Embed(
+            title="ToC Cleared",
+            description=f"Terms & Conditions removed from **{cat['name']}**.\nBuyers will go straight to purchase.",
+            color=0xA855F7,
+        )
+        await ctx.reply(embed=embed)
+        await send_log(discord.Embed(
+            title="📜  ToC Cleared",
+            description=f"**{cat['name']}** ToC removed by {ctx.author.mention}",
+            color=0xA855F7,
+        ))
+        return
+
+    # ── Set ToC ───────────────────────────────────────────────────────────────
+    if len(message) > 2000:
+        await ctx.reply("❌ ToC message too long (max 2000 characters).")
+        return
+
+    await set_toc(cat["slug"], message)
+
+    embed = discord.Embed(
+        title="✅  Terms & Conditions Set",
+        description=f"Buyers must now accept the ToC before purchasing **{cat['name']}**.",
+        color=0x7B2FBE,
+    )
+    embed.add_field(name="📜 ToC Message", value=message[:1024], inline=False)
+    embed.set_footer(text=f"Category: {cat['name']} ({cat['slug']})")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="📜  ToC Set",
+        description=f"**{cat['name']}** ToC updated by {ctx.author.mention}\n\n{message[:500]}",
+        color=0x9B59B6,
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &help [topic]
+# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NEW COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &addstock <category> <item>  — add one stock item manually
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="addstock")
+async def cmd_addstock(ctx: commands.Context, category: str, *, item: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    await db_restock(cat["slug"], [item])
+    updated = await db_get_category(cat["slug"])
+    embed = discord.Embed(title="✅  Stock Added", color=0x7B2FBE)
+    embed.add_field(name="Category",   value=cat["name"],                     inline=True)
+    embed.add_field(name="New Total",  value=str(len(updated.get("stock", []))), inline=True)
+    embed.add_field(name="Item Added", value=f"`{item[:80]}`",                inline=False)
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &stockcount  — total stock across all categories
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="stockcount")
+async def cmd_stockcount(ctx: commands.Context):
+    """View total stock across all products, broken down by group."""
+    cats = await db_get_categories()
+    if not cats:
+        await ctx.reply("❌ No products yet. Use `&category \"Name\" <price>` to create one.")
+        return
+
+    groups        = await db_get_groups()
+    group_lookup  = {g["slug"]: g["name"] for g in groups}
+    total         = sum(len(c.get("stock", [])) for c in cats if not c.get("infinite_stock"))
+
+    by_group: dict = {}
+    for c in cats:
+        by_group.setdefault(c.get("group"), []).append(c)
+
+    embed = discord.Embed(title="📊  Stock Count", color=0x9B59B6)
+    for group_slug, group_cats in by_group.items():
+        group_name = group_lookup.get(group_slug)
+        header = f"📁 {group_name}" if group_name else "📂 Ungrouped"
+        lines = [
+            f"**{c['name']}** — {'♾️' if c.get('infinite_stock') else len(c.get('stock', []))}"
+            for c in group_cats
+        ]
+        embed.add_field(name=header, value="\n".join(lines), inline=False)
+
+    embed.set_footer(text=f"Total across all products: {total}")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &stockalert <category> <number>  — ping admin when stock drops below number
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="stockalert")
+async def cmd_stockalert(ctx: commands.Context, category: str, threshold: int):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"alertThreshold": threshold}})
+    await ctx.reply(f"✅ Stock alert set for **{cat['name']}** — admins will be pinged when stock drops below **{threshold}**.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &movestock <from_category> <to_category>  — move all stock between categories
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="movestock")
+async def cmd_movestock(ctx: commands.Context, from_cat: str, to_cat: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat_from = await db_find_category(from_cat)
+    cat_to   = await db_find_category(to_cat)
+    if not cat_from:
+        await ctx.reply(f"❌ Source category `{from_cat}` not found.")
+        return
+    if not cat_to:
+        await ctx.reply(f"❌ Destination category `{to_cat}` not found.")
+        return
+    stock = cat_from.get("stock", [])
+    if not stock:
+        await ctx.reply(f"❌ **{cat_from['name']}** has no stock to move.")
+        return
+    await col_cats.update_one({"slug": cat_to["slug"]},   {"$push": {"stock": {"$each": stock}}})
+    await col_cats.update_one({"slug": cat_from["slug"]}, {"$set":  {"stock": []}})
+    await send_log(discord.Embed(
+        title="📦  Stock Moved",
+        description=f"{len(stock)} items moved from **{cat_from['name']}** → **{cat_to['name']}** by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    embed = discord.Embed(title="✅  Stock Moved", color=0x7B2FBE)
+    embed.add_field(name="From",        value=cat_from["name"], inline=True)
+    embed.add_field(name="To",          value=cat_to["name"],   inline=True)
+    embed.add_field(name="Items Moved", value=str(len(stock)),  inline=True)
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &order <order_id>  — look up a specific order
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="order")
+async def cmd_order(ctx: commands.Context, order_id: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    order = await db_get_order(order_id)
+    if not order:
+        await ctx.reply(f"❌ Order `{order_id}` not found.")
+        return
+    icons = {"pending": "🟡", "awaiting_confirmation": "🔵", "delivered": "🟢",
+             "cancelled": "🔴", "expired": "⚫", "error": "🟠"}
+    embed = discord.Embed(
+        title=f"{icons.get(order['status'], '⚪')}  Order — {order['orderId']}",
+        color=0x9B59B6,
+    )
+    embed.add_field(name="User",     value=f"<@{order['userId']}>",              inline=True)
+    embed.add_field(name="Product",  value=order["categoryName"],                 inline=True)
+    embed.add_field(name="Status",   value=order["status"],                       inline=True)
+    embed.add_field(name="🔢  Quantity", value=str(order["quantity"]),                inline=True)
+    embed.add_field(name="LTC",      value=str(order["ltcAmount"]),               inline=True)
+    embed.add_field(name="USD",      value=f"${order['totalUSD']:.2f}",          inline=True)
+    embed.add_field(name="TX ID",    value=f"`{order.get('txId', 'N/A')}`",      inline=False)
+    embed.add_field(name="Created",  value=order.get("createdAt", "N/A")[:19],   inline=True)
+    embed.add_field(name="Paid",     value=(order.get("paidAt") or "N/A")[:19],  inline=True)
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &refund <order_id>  — mark an order as refunded
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="refund")
+async def cmd_refund(ctx: commands.Context, order_id: str, *, reason: str = "Admin refund"):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    order = await db_get_order(order_id)
+    if not order:
+        await ctx.reply(f"❌ Order `{order_id}` not found.")
+        return
+    await db_update_order(order_id, {"status": "refunded", "refundReason": reason, "refundedBy": str(ctx.author.id)})
+    await send_log(discord.Embed(
+        title="💸  Order Refunded",
+        description=f"**Order:** `{order_id}`\n**By:** {ctx.author.mention}\n**Reason:** {reason}",
+        color=0xA855F7,
+    ))
+    embed = discord.Embed(title="✅  Order Marked as Refunded", color=0xA855F7)
+    embed.add_field(name="Order ID", value=order_id,          inline=True)
+    embed.add_field(name="Product",  value=order["categoryName"], inline=True)
+    embed.add_field(name="Reason",   value=reason,            inline=False)
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &forcedelivery <order_id>  — manually deliver a paid order
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="forcedelivery")
+async def cmd_forcedelivery(ctx: commands.Context, order_id: str):
+    """Admin: Force deliver an order — full flow identical to real payment confirmation."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    order = await db_get_order(order_id)
+    if not order:
+        await ctx.reply(f"❌ Order `{order_id}` not found.")
+        return
+    if order["status"] == "delivered":
+        await ctx.reply("❌ Order is already delivered.")
+        return
+    items = await db_consume_stock(order["categorySlug"], order["quantity"])
+    if not items:
+        await ctx.reply(f"❌ Not enough stock in **{order['categoryName']}** to fulfil this order.")
+        return
+
+    cat              = await db_get_category(order["categorySlug"])
+    instruction_text = f"\n\n📌 **Instructions:**\n{cat['instruction']}" if cat and cat.get("instruction") else ""
+    delivery_lines   = "\n".join(f"**{i+1}.** `{item}`" for i, item in enumerate(items))
+
+    await db_update_order(order_id, {
+        "status":           "delivered",
+        "paidAt":           datetime.utcnow().isoformat(),
+        "deliveredItems":   items,
+        "forceDeliveredBy": str(ctx.author.id),
+    })
+
+    # Resolve buyer and ticket channel
+    try:
+        buyer = ctx.guild.get_member(int(order["userId"])) or await bot.fetch_user(int(order["userId"]))
+    except Exception:
+        buyer = None
+
+    channel_id = order.get("channelId")
+    ch = ctx.guild.get_channel(int(channel_id)) if channel_id and ctx.guild else None
+
+    # Reply to admin
+    admin_embed = discord.Embed(title="✅  Force Delivered", color=0x7B2FBE)
+    admin_embed.add_field(name="Order ID", value=order_id,              inline=True)
+    admin_embed.add_field(name="Product",  value=order["categoryName"], inline=True)
+    admin_embed.add_field(name="Buyer",    value=f"<@{order['userId']}>", inline=True)
+    await ctx.reply(embed=admin_embed)
+
+    # Post in ticket channel
+    if ch:
+        try:
+            await ch.edit(topic=f"Order: {order_id} | Status: delivered | Product: {order['categoryName']}")
+        except Exception:
+            pass
+        await ch.send(embed=discord.Embed(
+            title="✅  Order Delivered",
+            description=f"{buyer.mention if buyer else 'Buyer'} — Delivered by admin. Items sent to your DMs.",
+            color=0x7B2FBE,
+        ))
+
+    # DM: items
+    if buyer:
+        try:
+            dm = discord.Embed(
+                title="🔑  Your Order Items",
+                description=(
+                    f"**Product:** {order['categoryName']}\n"
+                    f"**Quantity:** {order['quantity']}\n"
+                    f"**Order ID:** `{order_id}`\n\n"
+                    f"**Your Items:**\n{delivery_lines}{instruction_text}"
+                ),
+                color=0x7B2FBE,
+            )
+            dm.set_footer(text=f"Order: {order_id}")
+            await buyer.send(embed=dm)
+        except Exception:
+            if ch:
+                await ch.send(content=buyer.mention, embed=discord.Embed(
+                    title="⚠️  Could Not Send DM — Items Posted Here",
+                    description=delivery_lines + instruction_text,
+                    color=0xA855F7,
+                ))
+
+    # Log
+    await send_log(discord.Embed(
+        title="⚡  Force Delivery",
+        description=(
+            f"**Order:** `{order_id}`\n"
+            f"**Product:** {order['categoryName']} × {order['quantity']}\n"
+            f"**By:** {ctx.author.mention}\n"
+            f"**Buyer:** <@{order['userId']}>"
+        ),
+        color=0x9B59B6,
+    ))
+
+    # Close ticket channel
+    if ch and buyer:
+        asyncio.create_task(close_order_channel(ch, buyer=buyer))
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &cancelorder <order_id>  — admin force cancel any order
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="cancelorder")
+async def cmd_cancelorder(ctx: commands.Context, order_id: str, *, reason: str = "Cancelled by admin"):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    order = await db_get_order(order_id)
+    if not order:
+        await ctx.reply(f"❌ Order `{order_id}` not found.")
+        return
+    await db_update_order(order_id, {"status": "cancelled", "cancelReason": reason})
+    await send_log(discord.Embed(
+        title="❌  Order Force Cancelled",
+        description=f"**Order:** `{order_id}`\n**By:** {ctx.author.mention}\n**Reason:** {reason}",
+        color=0xE74C3C,
+    ))
+    await ctx.reply(f"✅ Order `{order_id}` cancelled. Reason: {reason}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &orderhistory <@user>  — all orders from a specific user
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="orderhistory")
+async def cmd_orderhistory(ctx: commands.Context, user: discord.Member):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    orders = await col_orders.find({"userId": str(user.id)}, {"_id": 0}).sort("createdAt", -1).limit(10).to_list(10)
+    if not orders:
+        await ctx.reply(f"No orders found for {user.mention}.")
+        return
+    icons = {"pending": "🟡", "awaiting_confirmation": "🔵", "delivered": "🟢",
+             "cancelled": "🔴", "expired": "⚫", "error": "🟠"}
+    embed = discord.Embed(title=f"📋  Order History — {user.display_name}", color=0x9B59B6)
+    for o in orders:
+        embed.add_field(
+            name=f"{icons.get(o['status'], '⚪')} {o['orderId']}",
+            value=f"{o['categoryName']} × {o['quantity']} • {o['ltcAmount']} LTC • **{o['status']}**",
+            inline=False,
+        )
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &blacklist <@user> [reason]  /  &unblacklist <@user>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="blacklist")
+async def cmd_blacklist(ctx: commands.Context, user: discord.Member, *, reason: str = "No reason given"):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    await col_blacklist.update_one(
+        {"userId": str(user.id)},
+        {"$set": {"userId": str(user.id), "reason": reason, "addedAt": datetime.utcnow().isoformat(), "addedBy": str(ctx.author.id)}},
+        upsert=True,
+    )
+    await send_log(discord.Embed(
+        title="🚫  User Blacklisted",
+        description=f"**User:** {user.mention}\n**Reason:** {reason}\n**By:** {ctx.author.mention}",
+        color=0xE74C3C,
+    ))
+    await ctx.reply(f"🚫 **{user.display_name}** has been blacklisted. Reason: {reason}")
+
+@bot.command(name="unblacklist")
+async def cmd_unblacklist(ctx: commands.Context, user: discord.Member):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    result = await col_blacklist.delete_one({"userId": str(user.id)})
+    if result.deleted_count == 0:
+        await ctx.reply(f"❌ **{user.display_name}** is not blacklisted.")
+        return
+    await ctx.reply(f"✅ **{user.display_name}** removed from blacklist.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &setprice <category> <price>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="setprice")
+async def cmd_setprice(ctx: commands.Context, category: str, price: float):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    old_price = cat["price_usd"]
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"price_usd": price}})
+    await send_log(discord.Embed(
+        title="💰  Price Updated",
+        description=f"**{cat['name']}**: ${old_price} → ${price} by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    embed = discord.Embed(title="✅  Price Updated", color=0x7B2FBE)
+    embed.add_field(name="Category",  value=cat["name"],         inline=True)
+    embed.add_field(name="Old Price", value=f"${old_price:.2f}", inline=True)
+    embed.add_field(name="New Price", value=f"${price:.2f}",     inline=True)
+    embed.set_footer(text="Run &updatepanel to refresh the panel.")
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &setaddress <ltc_address>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="setaddress")
+async def cmd_setaddress(ctx: commands.Context, *, address: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    global LTC_WALLET_ADDRESS
+    await set_setting("ltc_wallet_override", address)
+    LTC_WALLET_ADDRESS = address
+    await send_log(discord.Embed(
+        title="💳  LTC Address Updated",
+        description=f"New address: `{address}`\nBy: {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    embed = discord.Embed(title="✅  LTC Wallet Address Updated", color=0x7B2FBE)
+    embed.add_field(name="New Address", value=f"`{address}`", inline=False)
+    embed.set_footer(text="Takes effect on the next order immediately.")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &checkwallet
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="checkwallet")
+async def cmd_checkwallet(ctx: commands.Context):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if not APIRONE_ACCOUNT:
+        await ctx.reply("❌ `APIRONE_ACCOUNT` not set in env vars.")
+        return
+    url = f"https://apirone.com/api/v2/accounts/{APIRONE_ACCOUNT}/balance?currency=ltc"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                text = await r.text()
+                if r.status != 200:
+                    await ctx.reply(f"❌ Apirone returned HTTP {r.status}: {text[:200]}")
+                    return
+                import json as _jj
+                data = _jj.loads(text)
+                # Apirone account balance: {"account":..,"balance":[{"currency":"ltc","available":N,"total":N},...]}
+                bal_list = data.get("balance", [])
+                if not isinstance(bal_list, list):
+                    bal_list = [bal_list]
+                ltc_bal = next((b for b in bal_list if str(b.get("currency","")).lower() == "ltc"), {})
+                avail_ltc = round(ltc_bal.get("available", 0) / 1e8, 8)
+                total_ltc = round(ltc_bal.get("total", 0) / 1e8, 8)
+                embed = discord.Embed(title="💳  Apirone Account Balance", color=0x9B59B6)
+                embed.add_field(name="Account",      value=f"`{APIRONE_ACCOUNT}`",                inline=False)
+                embed.add_field(name="Available",    value=f"{avail_ltc} LTC",                    inline=True)
+                embed.add_field(name="💰  Order Total",        value=f"{total_ltc} LTC",                    inline=True)
+                embed.add_field(name="Master Wallet",value=f"`{LTC_WALLET_ADDRESS or 'not set'}`",inline=False)
+                await ctx.reply(embed=embed)
+    except Exception as e:
+        await ctx.reply(f"❌ Could not fetch balance: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &stats  — total orders, revenue, top selling product
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="stats")
+async def cmd_stats(ctx: commands.Context):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    total_orders    = await col_orders.count_documents({})
+    delivered       = await col_orders.count_documents({"status": "delivered"})
+    cancelled       = await col_orders.count_documents({"status": "cancelled"})
+    revenue_cursor  = col_orders.aggregate([
+        {"$match": {"status": "delivered"}},
+        {"$group": {"_id": None, "total_usd": {"$sum": "$totalUSD"}, "total_ltc": {"$sum": "$ltcAmount"}}},
+    ])
+    revenue = await revenue_cursor.to_list(1)
+    total_usd = revenue[0]["total_usd"] if revenue else 0
+    total_ltc = revenue[0]["total_ltc"] if revenue else 0
+
+    top_cursor = col_orders.aggregate([
+        {"$match": {"status": "delivered"}},
+        {"$group": {"_id": "$categoryName", "count": {"$sum": "$quantity"}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 3},
+    ])
+    top = await top_cursor.to_list(3)
+
+    embed = discord.Embed(title="📊  Store Statistics", color=0x9B59B6)
+    embed.add_field(name="Total Orders",    value=str(total_orders), inline=True)
+    embed.add_field(name="Delivered",       value=str(delivered),    inline=True)
+    embed.add_field(name="Cancelled",       value=str(cancelled),    inline=True)
+    embed.add_field(name="Revenue (USD)",   value=f"${total_usd:.2f}", inline=True)
+    embed.add_field(name="Revenue (LTC)",   value=f"{round(total_ltc, 4)} LTC", inline=True)
+    embed.add_field(name="\u200b",          value="\u200b",          inline=True)
+    if top:
+        top_str = "\n".join(f"**{i+1}.** {t['_id']} — {t['count']} units" for i, t in enumerate(top))
+        embed.add_field(name="🏆 Top Sellers", value=top_str, inline=False)
+    embed.set_footer(text=f"All-time stats • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &revenue  — earnings breakdown
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="revenue")
+async def cmd_revenue(ctx: commands.Context):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    now   = datetime.utcnow()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    week  = (now - __import__("datetime").timedelta(days=7)).isoformat()
+
+    async def get_rev(match_extra=None):
+        match = {"status": "delivered"}
+        if match_extra:
+            match.update(match_extra)
+        cur = col_orders.aggregate([
+            {"$match": match},
+            {"$group": {"_id": None, "usd": {"$sum": "$totalUSD"}, "ltc": {"$sum": "$ltcAmount"}, "count": {"$sum": 1}}},
+        ])
+        r = await cur.to_list(1)
+        return r[0] if r else {"usd": 0, "ltc": 0, "count": 0}
+
+    r_today    = await get_rev({"paidAt": {"$gte": today}})
+    r_week     = await get_rev({"paidAt": {"$gte": week}})
+    r_alltime  = await get_rev()
+
+    embed = discord.Embed(title="💰  Revenue Breakdown", color=0x7B2FBE)
+    embed.add_field(name="📅 Today",    value=f"${r_today['usd']:.2f} ({r_today['count']} orders)",   inline=False)
+    embed.add_field(name="📆 7 Days",   value=f"${r_week['usd']:.2f} ({r_week['count']} orders)",    inline=False)
+    embed.add_field(name="🗓️ All Time", value=f"${r_alltime['usd']:.2f} ({r_alltime['count']} orders)", inline=False)
+    embed.set_footer(text=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &topsellers
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="topsellers")
+async def cmd_topsellers(ctx: commands.Context):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cur = col_orders.aggregate([
+        {"$match": {"status": "delivered"}},
+        {"$group": {"_id": "$categoryName", "units": {"$sum": "$quantity"}, "revenue": {"$sum": "$totalUSD"}}},
+        {"$sort": {"units": -1}},
+        {"$limit": 10},
+    ])
+    top = await cur.to_list(10)
+    if not top:
+        await ctx.reply("No delivered orders yet.")
+        return
+    embed = discord.Embed(title="🏆  Top Selling Products", color=0x8B5CF6)
+    medals = ["🥇", "🥈", "🥉"]
+    for i, t in enumerate(top):
+        medal = medals[i] if i < 3 else f"#{i+1}"
+        embed.add_field(
+            name=f"{medal}  {t['_id']}",
+            value=f"{t['units']} units sold • ${t['revenue']:.2f} revenue",
+            inline=False,
+        )
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &closeticket  — admin force closes current ticket channel
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="closeticket")
+async def cmd_closeticket(ctx: commands.Context):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if not ctx.channel.name.startswith("order-"):
+        await ctx.reply("❌ This command can only be used inside an order ticket channel.")
+        return
+    await ctx.reply("🔒 Closing this ticket...")
+    # Find buyer from channel overwrites
+    buyer = None
+    for target, ow in ctx.channel.overwrites.items():
+        if isinstance(target, discord.Member) and not target.bot and not target.guild_permissions.administrator:
+            buyer = target
+            break
+    asyncio.create_task(close_order_channel_cancel(ctx.channel, buyer=buyer))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &adduser <@user>  /  &removeuser <@user>  — manage ticket access
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="adduser")
+async def cmd_adduser(ctx: commands.Context, user: discord.Member):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    await ctx.channel.set_permissions(user, view_channel=True, send_messages=True, read_message_history=True)
+    await ctx.reply(f"✅ {user.mention} added to this channel.")
+
+@bot.command(name="removeuser")
+async def cmd_removeuser(ctx: commands.Context, user: discord.Member):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    await ctx.channel.set_permissions(user, overwrite=None)
+    await ctx.reply(f"✅ {user.mention} removed from this channel.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &renameticket <new_name>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="renameticket")
+async def cmd_renameticket(ctx: commands.Context, *, name: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    safe = name.lower().replace(" ", "-")[:50]
+    await ctx.channel.edit(name=safe)
+    await ctx.reply(f"✅ Channel renamed to **{safe}**.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &setprefix <prefix>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="setprefix")
+async def cmd_setprefix(ctx: commands.Context, prefix: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if len(prefix) > 3:
+        await ctx.reply("❌ Prefix must be 3 characters or fewer.")
+        return
+    await set_setting("prefix", prefix)
+    bot.command_prefix = prefix
+    await ctx.reply(f"✅ Prefix changed to `{prefix}`. All commands now use `{prefix}command`.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &settimeout <minutes>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="settimeout")
+async def cmd_settimeout(ctx: commands.Context, minutes: int):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if minutes < 5 or minutes > 1440:
+        await ctx.reply("❌ Timeout must be between 5 and 1440 minutes.")
+        return
+    global PAYMENT_TIMEOUT_MIN
+    PAYMENT_TIMEOUT_MIN = minutes
+    await set_setting("payment_timeout", str(minutes))
+    await ctx.reply(f"✅ Payment timeout set to **{minutes} minutes**.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &setstatus <text>
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="setstatus")
+async def cmd_setstatus(ctx: commands.Context, *, text: str):
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=text))
+    await set_setting("bot_status", text)
+    await ctx.reply(f"✅ Bot status set to: *{text}*")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &botstats
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="botstats")
+async def cmd_botstats(ctx: commands.Context):
+    uptime_str = "Unknown"
+    if bot_start_time:
+        delta   = datetime.utcnow() - bot_start_time
+        hours   = int(delta.total_seconds() // 3600)
+        minutes = int((delta.total_seconds() % 3600) // 60)
+        uptime_str = f"{hours}h {minutes}m"
+
+    latency = round(bot.latency * 1000)
+    total   = await col_orders.count_documents({})
+    delivered = await col_orders.count_documents({"status": "delivered"})
+
+    embed = discord.Embed(title="🤖  Bot Statistics", color=0x7C3AED)
+    embed.add_field(name="⏱️ Uptime",          value=uptime_str,       inline=True)
+    embed.add_field(name="📶 Ping",             value=f"{latency}ms",   inline=True)
+    embed.add_field(name="🏷️ Version",          value="AutoBuy v1.0",   inline=True)
+    embed.add_field(name="📦 Total Orders",     value=str(total),       inline=True)
+    embed.add_field(name="✅ Delivered",         value=str(delivered),   inline=True)
+    embed.add_field(name="🗄️ DB",               value=DB_NAME,          inline=True)
+    embed.set_footer(text=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &help  — all buyer/user commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &ping
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="ping")
+async def cmd_ping(ctx: commands.Context):
+    """Check if the bot is alive and see current latency."""
+    latency = round(bot.latency * 1000)
+    color   = 0x2ECC71 if latency < 150 else (0xF39C12 if latency < 400 else 0xE74C3C)
+    await ctx.reply(embed=discord.Embed(
+        title="🏓  Pong!",
+        description=f"Latency: **{latency}ms**",
+        color=color,
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &resume  — re-attach payment polling to all awaiting_confirmation orders
+#  Run this after a bot restart to resume any in-progress payments
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="resume")
+async def cmd_resume(ctx: commands.Context):
+    """
+    Admin: Resume payment checking for all orders that were awaiting confirmation
+    when the bot restarted. Run this once after every restart.
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    pending = await col_orders.find(
+        {"status": "awaiting_confirmation"},
+        {"_id": 0}
+    ).to_list(50)
+
+    if not pending:
+        await ctx.reply("✅ No orders awaiting confirmation — nothing to resume.")
+        return
+
+    resumed = 0
+    skipped = 0
+    for order in pending:
+        channel_id = order.get("channelId")
+        if not channel_id or not ctx.guild:
+            skipped += 1
+            continue
+        channel = ctx.guild.get_channel(int(channel_id))
+        if not channel:
+            skipped += 1
+            continue
+        try:
+            user = ctx.guild.get_member(int(order["userId"])) or await bot.fetch_user(int(order["userId"]))
+        except Exception:
+            user = None
+        if not user:
+            skipped += 1
+            continue
+
+        # Actually re-attach polling — this was the bug (it was only counting, not resuming)
+        asyncio.create_task(poll_apirone_payment(order["orderId"], channel, user))
+        resumed += 1
+
+    embed = discord.Embed(title="✅  Resume Complete", color=0x7B2FBE)
+    embed.add_field(name="▶️ Resumed", value=str(resumed), inline=True)
+    embed.add_field(name="⏭️ Skipped", value=str(skipped), inline=True)
+    embed.set_footer(text="Skipped orders had missing channels or users.")
+    await ctx.reply(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auto-resume on bot start — resume all awaiting_confirmation orders
+# ─────────────────────────────────────────────────────────────────────────────
+async def auto_resume_on_ready(guild: discord.Guild):
+    """
+    Called from on_ready.
+    Expires timed-out orders, notifies open tickets, and restarts backup polling.
+    """
+    await asyncio.sleep(5)
+
+    import datetime as _dt
+    cutoff = (datetime.utcnow() - _dt.timedelta(minutes=PAYMENT_TIMEOUT_MIN)).isoformat()
+    stale = await col_orders.find(
+        {"status": "awaiting_confirmation", "createdAt": {"$lt": cutoff}},
+        {"_id": 0},
+    ).to_list(50)
+    for order in stale:
+        await db_update_order(order["orderId"], {"status": "expired"})
+    if stale:
+        print(f"[auto-resume] Expired {len(stale)} timed-out order(s) on startup.")
+
+    pending = await col_orders.find({"status": "awaiting_confirmation"}, {"_id": 0}).to_list(50)
+    for order in pending:
+        channel_id = order.get("channelId")
+        if not channel_id:
+            continue
+        channel = guild.get_channel(int(channel_id))
+        if not channel:
+            continue
+        try:
+            await channel.send(embed=discord.Embed(
+                title="🔄  Bot Restarted — Payment Still Monitored",
+                description=(
+                    "The bot restarted. Your payment is still being monitored.\n\n"
+                    f"**Order:** `{order['orderId']}`\n"
+                    f"**Address:** `{order.get('ltcAddress', 'N/A')}`\n"
+                    f"**Amount:** `{order['ltcAmount']} LTC`"
+                ),
+                color=0x9B59B6,
+            ))
+        except Exception:
+            pass
+        try:
+            user = guild.get_member(int(order["userId"])) or await bot.fetch_user(int(order["userId"]))
+        except Exception:
+            user = None
+        asyncio.create_task(poll_apirone_payment(order["orderId"], channel, user))
+    if pending:
+        print(f"[auto-resume] Resumed polling for {len(pending)} open order(s).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &verify <order_id>  — admin force-checks payment right now
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="verify")
+async def cmd_verify(ctx: commands.Context, order_id: str):
+    """
+    Admin: Force an immediate payment check for an order, bypassing the 30s poll interval.
+    Useful when buyer says they paid and you want to check right now.
+
+    Usage:
+      &verify ORD-1234567890-ABCDEF
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    order = await db_get_order(order_id)
+    if not order:
+        await ctx.reply(f"❌ Order `{order_id}` not found.")
+        return
+
+    status = order.get("status", "")
+    if status == "delivered":
+        await ctx.reply(f"✅ Order `{order_id}` is already **delivered**.")
+        return
+    if status in ("cancelled", "expired", "error"):
+        await ctx.reply(f"❌ Order `{order_id}` is **{status}** — cannot verify.")
+        return
+
+    addr = order.get("ltcAddress", "")
+    msg  = await ctx.reply(embed=discord.Embed(
+        title="🔍  Checking Payment via Apirone...",
+        description=f"Checking address balance for order `{order_id}`...",
+        color=0x9B59B6,
+    ))
+
+    # Check balance via Apirone
+    if addr and not LTC_DEV_MODE:
+        bal = await apirone_get_address_balance(addr)
+        avail = bal.get("available", 0)
+        expected = int(order["ltcAmount"] * 1e8)
+        tolerance = int(FEE_TOLERANCE_LTC * 1e8)
+        if avail < expected - tolerance:
+            await msg.edit(embed=discord.Embed(
+                title="❌  Payment Not Confirmed",
+                description=(
+                    f"**Order:** `{order_id}`\n"
+                    f"**Expected:** {order['ltcAmount']} LTC\n"
+                    f"**Available:** {round(avail/1e8, 8)} LTC\n"
+                    f"**Address:** `{addr}`\n\n"
+                    "Payment not detected or not yet confirmed. Use `&forcedelivery` to deliver manually."
+                ),
+                color=0xA855F7,
+            ))
+            return
+    # Payment confirmed or dev mode — proceed with delivery
+
+    channel_id = order.get("channelId")
+    channel    = ctx.guild.get_channel(int(channel_id)) if channel_id else None
+    buyer      = ctx.guild.get_member(int(order["userId"])) if ctx.guild else None
+
+    items = await db_consume_stock(order["categorySlug"], order["quantity"])
+    if not items:
+        await msg.edit(embed=discord.Embed(
+            title="⚠️  No Stock Available",
+            description=f"Could not deliver **{order['categoryName']}** — stock is empty. Restock and try again.",
+            color=0xA855F7,
+        ))
+        return
+
+    cat              = await db_get_category(order["categorySlug"])
+    instruction_text = f"\n\n📌 **Instructions:**\n{cat['instruction']}" if cat and cat.get("instruction") else ""
+    delivery_lines   = "\n".join(f"**{i+1}.** `{item}`" for i, item in enumerate(items))
+
+    await db_update_order(order_id, {
+        "status":           "delivered",
+        "paidAt":           datetime.utcnow().isoformat(),
+        "deliveredItems":   items,
+        "manualVerifiedBy": str(ctx.author.id),
+        "paidVia":          "manual_verify",
+    })
+
+    await msg.edit(embed=discord.Embed(
+        title="✅  Order Force-Delivered!",
+        description=(
+            f"**Order:** `{order_id}`\n"
+            f"**Product:** {order['categoryName']} × {order['quantity']}\n"
+            f"**Verified by:** {ctx.author.mention}"
+        ),
+        color=0x7B2FBE,
+    ))
+
+    if buyer:
+        try:
+            dm = discord.Embed(
+                title="✅  Your Order Has Been Delivered!",
+                description=(
+                    f"**Product:** {order['categoryName']}\n"
+                    f"**Quantity:** {order['quantity']}\n"
+                    f"**Order ID:** `{order_id}`\n\n"
+                    f"**Your Items:**\n{delivery_lines}{instruction_text}"
+                ),
+                color=0x7B2FBE,
+            )
+            dm.set_footer(text="Thank you for your purchase!")
+            await buyer.send(embed=dm)
+        except Exception:
+            if channel:
+                await channel.send(content=buyer.mention, embed=discord.Embed(
+                    title="🔑  Your Items",
+                    description=delivery_lines + instruction_text,
+                    color=0x7B2FBE,
+                ))
+
+    if channel:
+        try:
+            await channel.edit(topic=f"Order: {order_id} | Status: delivered | Product: {order['categoryName']}")
+        except Exception:
+            pass
+        await channel.send(embed=discord.Embed(
+            title="✅  Order Delivered",
+            description=f"Manually delivered by {ctx.author.mention}. Items sent to DMs.",
+            color=0x7B2FBE,
+        ))
+        asyncio.create_task(close_order_channel(channel, buyer=buyer))
+
+    await send_log(discord.Embed(
+        title="💳  Manual Verify — Delivered",
+        description=(
+            f"**Order:** `{order_id}`\n"
+            f"**By:** {ctx.author.mention}\n"
+            f"**Product:** {order['categoryName']} × {order['quantity']}"
+        ),
+        color=0x7B2FBE,
+    ))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &sendfund  — manually transfer all LTC in Apirone account to master wallet
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="sendfund")
+async def cmd_sendfund(ctx: commands.Context):
+    """Admin: Transfer 100% of available LTC in Apirone account to LTC_WALLET_ADDRESS."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    if not APIRONE_ACCOUNT or not APIRONE_TRANSFER_KEY or not LTC_WALLET_ADDRESS:
+        await ctx.reply(embed=discord.Embed(
+            title="❌  Config Missing",
+            description=(
+                "One or more required env vars are not set:\n"
+                "• `APIRONE_ACCOUNT`\n"
+                "• `APIRONE_TRANSFER_KEY`\n"
+                "• `LTC_WALLET_ADDRESS`"
+            ),
+            color=0xE74C3C,
+        ))
+        return
+
+    msg = await ctx.reply(embed=discord.Embed(
+        title="⏳  Checking balance...",
+        color=0x9B59B6,
+    ))
+
+    # ── Step 1: fetch available balance ───────────────────────────────────────
+    try:
+        url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/balance?currency=ltc"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                bal  = next((b for b in data.get("balance", []) if b.get("currency") == "ltc"), {})
+                avail_litoshis = int(bal.get("available", 0))
+                total_litoshis = int(bal.get("total", 0))
+    except Exception as e:
+        await msg.edit(embed=discord.Embed(
+            title="❌  Balance Fetch Failed",
+            description=f"Could not fetch Apirone balance:\n`{e}`",
+            color=0xE74C3C,
+        ))
+        return
+
+    avail_ltc = avail_litoshis / 1e8
+    total_ltc = total_litoshis / 1e8
+
+    if avail_litoshis <= 0:
+        await msg.edit(embed=discord.Embed(
+            title="⚠️  No Available Balance",
+            description=(
+                f"**Available:** `{avail_ltc} LTC`\n"
+                f"**Total (incl. unconfirmed):** `{total_ltc} LTC`\n\n"
+                f"Nothing to send — balance is zero or still unconfirmed."
+            ),
+            color=0xA855F7,
+        ))
+        return
+
+    await msg.edit(embed=discord.Embed(
+        title="⏳  Sending funds...",
+        description=f"Transferring `{avail_ltc} LTC` → `{LTC_WALLET_ADDRESS}`",
+        color=0x9B59B6,
+    ))
+
+    # ── Step 2: transfer 100% to master wallet ────────────────────────────────
+    try:
+        transfer_url = f"{APIRONE_BASE}/accounts/{APIRONE_ACCOUNT}/transfer"
+        payload = {
+            "currency":                 "ltc",
+            "transfer-key":             APIRONE_TRANSFER_KEY,
+            "destinations":             [{"address": LTC_WALLET_ADDRESS, "amount": "100%"}],
+            "fee":                      "normal",
+            "subtract-fee-from-amount": True,
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.post(transfer_url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                text = await r.text()
+                print(f"[sendfund] Response {r.status}: {text[:400]}")
+
+                if r.status == 200:
+                    import json as _j
+                    d    = _j.loads(text)
+                    txs  = d.get("txs", [])
+                    txid = txs[0] if txs else "N/A"
+                    sent_litoshis = int(d.get("amount", avail_litoshis))
+                    sent_ltc      = sent_litoshis / 1e8
+
+                    await msg.edit(embed=discord.Embed(
+                        title="✅  Funds Sent!",
+                        description=(
+                            f"**Amount:** `{sent_ltc} LTC`\n"
+                            f"**To:** `{LTC_WALLET_ADDRESS}`\n"
+                            f"**TX:** `{txid}`\n\n"
+                            f"Funds are on their way to your master wallet."
+                        ),
+                        color=0x7B2FBE,
+                    ))
+                    await send_log(discord.Embed(
+                        title="💸  Manual Fund Transfer",
+                        description=(
+                            f"**By:** {ctx.author.mention}\n"
+                            f"**Amount:** {sent_ltc} LTC\n"
+                            f"**To:** `{LTC_WALLET_ADDRESS}`\n"
+                            f"**TX:** `{txid}`"
+                        ),
+                        color=0x7B2FBE,
+                    ))
+
+                else:
+                    import json as _j
+                    try:
+                        err = _j.loads(text)
+                        err_msg = err.get("message") or err.get("error") or text[:300]
+                    except Exception:
+                        err_msg = text[:300]
+                    await msg.edit(embed=discord.Embed(
+                        title="❌  Transfer Failed",
+                        description=(
+                            f"**Amount:** `{avail_ltc} LTC`\n"
+                            f"**Error:** {err_msg}\n\n"
+                            f"Check Railway logs for `[sendfund]` details."
+                        ),
+                        color=0xE74C3C,
+                    ))
+
+    except Exception as e:
+        await msg.edit(embed=discord.Embed(
+            title="❌  Transfer Exception",
+            description=f"`{e}`\n\nCheck Railway logs.",
+            color=0xE74C3C,
+        ))
+        import traceback; traceback.print_exc()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &deliver <@user> <category> <quantity>
+#  Admin: send stock directly to a user's DMs, no ticket/payment needed
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="deliver")
+async def cmd_deliver(ctx: commands.Context, user: discord.Member, category: str, quantity: int = 1):
+    """
+    Admin: Directly deliver stock to a user's DMs without any order/payment flow.
+
+    Usage:
+      &deliver @user netflix-1-month 2
+      &deliver @user "Netflix 1 Month" 1
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`. Use `&stock` to list all.")
+        return
+    if quantity < 1:
+        await ctx.reply("❌ Quantity must be at least 1.")
+        return
+
+    items = await db_consume_stock(cat["slug"], quantity)
+    if not items:
+        await ctx.reply(f"❌ Not enough stock in **{cat['name']}** ({quantity} requested, {len(cat.get('stock',[]))} available).")
+        return
+
+    cat_obj          = await db_get_category(cat["slug"])
+    instruction_text = f"\n\n📌 **Instructions:**\n{cat_obj['instruction']}" if cat_obj and cat_obj.get("instruction") else ""
+    delivery_lines   = "\n".join(f"**{i+1}.** `{item}`" for i, item in enumerate(items))
+
+    # Create a manual order record for logging
+    order_id = f"MANUAL-{int(datetime.utcnow().timestamp())}-{cat['slug'][:6].upper()}"
+    await col_orders.insert_one({
+        "orderId":        order_id,
+        "userId":         str(user.id),
+        "categorySlug":   cat["slug"],
+        "categoryName":   cat["name"],
+        "quantity":       quantity,
+        "totalUSD":       cat["price_usd"] * quantity,
+        "ltcAmount":      0,
+        "ltcAddress":     "manual",
+        "status":         "delivered",
+        "txId":           None,
+        "createdAt":      datetime.utcnow().isoformat(),
+        "paidAt":         datetime.utcnow().isoformat(),
+        "deliveredItems": items,
+        "manualDeliveredBy": str(ctx.author.id),
+    })
+
+    # DM the items — as a .txt file attachment for 5+ items, inline embed otherwise
+    try:
+        if len(items) >= 5:
+            import io as _io
+            txt_content = "\n".join(items)
+            if cat_obj and cat_obj.get("instruction"):
+                txt_content += f"\n\n--- Instructions ---\n{cat_obj['instruction']}"
+            txt_file = discord.File(
+                fp=_io.BytesIO(txt_content.encode("utf-8")),
+                filename=f"order-{order_id}.txt",
+            )
+            dm = discord.Embed(
+                title="🎁  You Have Received an Order",
+                description=(
+                    f"**Product:** {cat['name']}\n"
+                    f"**Quantity:** {quantity}\n"
+                    f"**Delivered by:** {ctx.author.display_name}\n\n"
+                    f"Your items are in the attached `.txt` file (one per line)."
+                ),
+                color=0x7B2FBE,
+            )
+            dm.set_footer(text=f"Order: {order_id}")
+            await user.send(embed=dm, file=txt_file)
+        else:
+            dm = discord.Embed(
+                title="🎁  You Have Received an Order",
+                description=(
+                    f"**Product:** {cat['name']}\n"
+                    f"**Quantity:** {quantity}\n"
+                    f"**Delivered by:** {ctx.author.display_name}\n\n"
+                    f"**Your Items:**\n{delivery_lines}{instruction_text}"
+                ),
+                color=0x7B2FBE,
+            )
+            dm.set_footer(text=f"Order: {order_id}")
+            await user.send(embed=dm)
+        dm_sent = True
+    except discord.Forbidden:
+        dm_sent = False
+
+    # Reply in channel — NO items shown here, only delivery status
+    dm_status = "✅ Product has been delivered to the user's DM." if dm_sent else "❌ DMs closed — items not delivered!"
+    embed = discord.Embed(
+        title="✅  Delivered",
+        description=(
+            f"**Product:** {cat['name']} × {quantity}\n"
+            f"**To:** {user.mention}\n"
+            f"**DM Sent:** {dm_status}"
+        ),
+        color=0x7B2FBE if dm_sent else 0xE74C3C,
+    )
+    # Items are intentionally NOT added here — they are only sent to the user's DM
+    await ctx.reply(embed=embed)
+
+    if not dm_sent:
+        await ctx.reply(f"⚠️ {user.mention} has DMs closed — items could not be delivered. Stock has been consumed.")
+
+    await send_log(discord.Embed(
+        title="🎁  Manual Delivery",
+        description=(
+            f"**By:** {ctx.author.mention}\n"
+            f"**To:** {user.mention}\n"
+            f"**Product:** {cat['name']} × {quantity}\n"
+            f"**DM:** {'sent' if dm_sent else 'FAILED — DMs closed'}\n"
+            f"**Order:** `{order_id}`"
+        ),
+        color=0x9B59B6,
+    ))
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &help  — user-facing help
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &setinfinitestock <category> <item>
+#  Sets a single item that is delivered for every purchase (infinite, never consumed)
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="setinfinitestock")
+async def cmd_setinfinitestock(ctx: commands.Context, category: str, *, item: str):
+    """
+    Admin: Set a single item that is delivered for EVERY purchase of this product.
+    Stock is never consumed — the same item is sent every time.
+
+    Usage:
+      &setinfinitestock netflix-1-month https://netflix.com/redeem/XXXXXXXXXXX
+      &setinfinitestock "Netflix 1M" user:pass123
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"infinite_stock": item}})
+    embed = discord.Embed(title="♾️  Infinite Stock Set", color=0x7B2FBE)
+    embed.add_field(name="Category", value=cat["name"],      inline=True)
+    embed.add_field(name="Item",     value=f"`{item[:80]}`", inline=False)
+    embed.set_footer(text="This item will be delivered for every purchase. Normal stock is ignored.")
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+@bot.command(name="clearinfinitestock")
+async def cmd_clearinfinitestock(ctx: commands.Context, *, category: str):
+    """
+    Admin: Remove infinite stock from a category. Normal stock list resumes.
+
+    Usage:
+      &clearinfinitestock netflix-1-month
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"infinite_stock": None}})
+    await ctx.reply(f"✅ Infinite stock removed from **{cat['name']}**. Normal stock list is now active.")
+    asyncio.create_task(auto_update_panel())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &setcustomltc <category> <ltc_address>
+#  Set a custom LTC destination for auto-transfer on this product's sales
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="setcustomltc")
+async def cmd_setcustomltc(ctx: commands.Context, category: str, *, address: str):
+    """
+    Admin: Set a custom LTC wallet address for auto-transfer on this category.
+    When a sale of this product completes, funds go here instead of the global wallet.
+
+    Usage:
+      &setcustomltc netflix-1-month LTC1abc...xyz
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"custom_ltc_dest": address}})
+    embed = discord.Embed(title="💳  Custom LTC Destination Set", color=0x7B2FBE)
+    embed.add_field(name="Category",    value=cat["name"],       inline=True)
+    embed.add_field(name="LTC Address", value=f"`{address}`",    inline=False)
+    embed.set_footer(text="Auto-transfer for this product will go to this address.")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="💳  Custom LTC Dest Set",
+        description=f"**{cat['name']}** → `{address}` by {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+
+
+@bot.command(name="clearcustomltc")
+async def cmd_clearcustomltc(ctx: commands.Context, *, category: str):
+    """
+    Admin: Remove the custom LTC destination for a category. Reverts to global wallet.
+
+    Usage:
+      &clearcustomltc netflix-1-month
+    """
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(f"❌ No category matching `{category}`.")
+        return
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"custom_ltc_dest": None}})
+    await ctx.reply(f"✅ Custom LTC destination removed from **{cat['name']}**. Global wallet is now used.")
+
+
+@bot.command(name="help")
+async def cmd_help(ctx: commands.Context):
+    """Interactive help — dropdown menu with sections. Admins see admin sections, users see buyer guide."""
+    admin = is_admin(ctx)
+
+    if admin:
+        select = discord.ui.Select(
+            placeholder="📖  Select a help section...",
+            options=[
+                discord.SelectOption(label="🏪  Shop Configuration",    value="shop",      description="Panel, name, banner, icon, prefix, timeout"),
+                discord.SelectOption(label="💎  Products & Stock",       value="stock",     description="Categories, pricing, restock, infinite stock"),
+                discord.SelectOption(label="🗂️  Groups",                 value="groups",    description="Organise products into groups/folders"),
+                discord.SelectOption(label="📋  Order Management",       value="orders",    description="View, deliver, cancel, refund, force-deliver"),
+                discord.SelectOption(label="📊  Analytics & Reporting",  value="analytics", description="Revenue, stats, top sellers, bot info"),
+                discord.SelectOption(label="🎟️  Ticket Management",      value="tickets",   description="Close, rename, add/remove users"),
+                discord.SelectOption(label="🚫  User Management",        value="users",     description="Blacklist and unblacklist buyers"),
+                discord.SelectOption(label="💰  Wallet & Payments",      value="wallet",    description="LTC address, balance, sweep funds"),
+            ],
+        )
+    else:
+        select = discord.ui.Select(
+            placeholder="📖  Select a help section...",
+            options=[
+                discord.SelectOption(label="🛒  How to Purchase",        value="buy",     description="Step-by-step buying guide"),
+                discord.SelectOption(label="⬡  Payment — Litecoin",      value="payment", description="How LTC payments work"),
+                discord.SelectOption(label="📦  Browsing Products",       value="browse",  description="View stock and product info"),
+                discord.SelectOption(label="❓  Support",                 value="support", description="Getting help from admins"),
+            ],
+        )
+
+    ADMIN_SECTIONS = {
+        "shop": (
+            "🏪  Shop Configuration",
+            (
+                "`&panel` — Deploy the shop panel in the current channel\n"
+                "`&updatepanel` — Refresh product listings & live stock counts\n"
+                "`&shopname <name>` — Set the store display name\n"
+                "`&shopbanner <url>` — Set the panel banner image\n"
+                "`&shopicon <url>` — Set the shop icon / thumbnail\n"
+                "`&shopsettings` — View all current shop configuration\n"
+                "`&setstatus <text>` — Update the bot's Discord status\n"
+                "`&setprefix <prefix>` — Change the command prefix\n"
+                "`&settimeout <minutes>` — Set the payment window duration\n"
+                "`&setaddress <address>` — Update the LTC receiving wallet"
+            ),
+        ),
+        "stock": (
+            "💎  Products & Stock",
+            (
+                "`&category 'Name' <price> [instruction]` — Create a new product category\n"
+                "`&categoryrename <old> | <new>` — Rename an existing category\n"
+                "`&editproduct <name> | <field> | <value>` — Edit name/price/description/instruction/minqty\n"
+                "`&setprice <name> <price>` — Update a product's price\n"
+                "`&setinstruction <name> <text>` — Edit post-delivery instructions\n"
+                "`&setminqty <name> <min>` — Set minimum purchase quantity\n"
+                "`&removecategory <name>` *(alias `&deleteproduct`)* — Permanently delete a category\n"
+                "`&addstock <name> <item>` — Add a single item to stock\n"
+                "`&restock <name>` *(+ .txt attachment)* — Bulk import stock\n"
+                "`&removestock <name>` — Clear all stock from a category\n"
+                "`&setinfinitestock <name> <item>` — Set a repeatable delivery item\n"
+                "`&clearinfinitestock <name>` — Remove infinite stock mode\n"
+                "`&setcustomltc <name> <address>` — Custom LTC destination per product\n"
+                "`&clearcustomltc <name>` — Remove custom LTC destination\n"
+                "`&movestock <from> <to>` — Transfer stock between categories\n"
+                "`&stockcount` — Full stock overview, grouped by group\n"
+                "`&stockalert <name> <n>` — Set low stock notification threshold\n"
+                "`&toc <name> <message>` — Set Terms & Conditions for a product\n"
+                "`&searchproduct <query>` — Search products by name/description\n"
+                "`&productinfo <name>` — Full detail card for one product"
+            ),
+        ),
+        "groups": (
+            "🗂️  Groups",
+            (
+                "Groups are folders used to organise products (e.g. \"Bot Src\", \"Tools\", \"Accounts\").\n\n"
+                "`&creategroup <name>` — Create a new group\n"
+                "`&renamegroup <old> | <new>` — Rename a group\n"
+                "`&deletegroup <name>` — Delete a group (products move to Ungrouped)\n"
+                "`&groups` — List all groups with product counts\n"
+                "`&groupproducts <group>` — List products in a group (`ungrouped` works too)\n"
+                "`&addtogroup <product> | <group>` *(alias `&moveproduct`)* — Assign/move a product into a group\n"
+                "`&removefromgroup <product>` — Unassign a product (moves it to Ungrouped)"
+            ),
+        ),
+        "orders": (
+            "📋  Order Management",
+            (
+                "`&orders` — View the last 10 orders\n"
+                "`&order <id>` — Look up a specific order by ID\n"
+                "`&orderitems <id>` — View exact items delivered for an order\n"
+                "`&orderhistory <@user>` — Full purchase history for a user\n"
+                "`&deliver <@user> <product> <qty>` — Manually deliver stock to a user\n"
+                "`&forcedelivery <id>` — Force-complete an existing order\n"
+                "`&cancelorder <id>` — Force-cancel an order\n"
+                "`&refund <id> [reason]` — Mark an order as refunded\n"
+                "`&verify <id>` — Manually trigger a payment check\n"
+                "`&resume` — Re-attach payment polling after a bot restart\n"
+                "`&deleteorder` — Archive & close completed order channels\n"
+                "`&clearhistory` — ⚠️ Permanently wipe all orders & blacklist entries"
+            ),
+        ),
+        "analytics": (
+            "📊  Analytics & Reporting",
+            (
+                "`&stats` — Total order count & lifetime revenue\n"
+                "`&revenue` — Earnings breakdown: today / 7 days / all time\n"
+                "`&topsellers` — Best-performing products by volume\n"
+                "`&botstats` — Uptime, latency & system info"
+            ),
+        ),
+        "tickets": (
+            "🎟️  Ticket Management",
+            (
+                "`&closeticket` — Force-close the current order ticket\n"
+                "`&adduser <@user>` — Add a user to the current ticket\n"
+                "`&removeuser <@user>` — Remove a user from the current ticket\n"
+                "`&renameticket <name>` — Rename the ticket channel"
+            ),
+        ),
+        "users": (
+            "🚫  User Management",
+            (
+                "`&blacklist <@user> [reason]` — Block a user from making purchases\n"
+                "`&unblacklist <@user>` — Remove a user from the blacklist"
+            ),
+        ),
+        "wallet": (
+            "💰  Wallet & Payments",
+            (
+                "`&setaddress <address>` — Update the LTC receiving wallet address\n"
+                "`&checkwallet` — View the current LTC wallet balance\n"
+                "`&sendfund` — Manually sweep all LTC to the master wallet"
+            ),
+        ),
+    }
+
+    USER_SECTIONS = {
+        "buy": (
+            "🛒  How to Purchase",
+            (
+                "**1.** Open the shop panel and use the dropdown to select **🎫 Create AutoBuy Ticket**.\n"
+                "**2.** A private order ticket opens just for you.\n"
+                "**3.** Pick your product from the in-ticket dropdown.\n"
+                "**4.** Type how many units you want and press Enter.\n"
+                "**5.** Send the exact LTC amount shown to the provided address.\n"
+                "**6.** Payment is confirmed automatically — items land in your DMs instantly."
+            ),
+        ),
+        "payment": (
+            "⬡  Payment — Litecoin (LTC)",
+            (
+                "› Every order generates a **unique** LTC deposit address just for you\n"
+                "› Send the **exact** amount shown — the bot checks to the decimal\n"
+                "› Confirmation is fully automatic via blockchain polling\n"
+                "› Delivery hits your **Discord DMs** within seconds of confirmation\n"
+                "› All payments are **irreversible** — verify the address before sending\n"
+                "› No transaction ID, no screenshots — just send and wait"
+            ),
+        ),
+        "browse": (
+            "📦  Browsing Products",
+            (
+                "`&stock` — View all products with live stock counts and prices\n"
+                "`&stock <name>` — View details for a specific product\n\n"
+                "You can also select **📦 Stock** from the shop panel dropdown to see availability at a glance."
+            ),
+        ),
+        "support": (
+            "❓  Support",
+            (
+                "If you run into any issues during your order:\n\n"
+                "› Press **🆘 Request Admin Support** in the invoice view inside your ticket\n"
+                "› Do **not** open multiple tickets for the same order\n"
+                "› Do **not** DM random members — use the ticket system\n\n"
+                "An admin will assist you as soon as possible."
+            ),
+        ),
+    }
+
+    sections = ADMIN_SECTIONS if admin else USER_SECTIONS
+
+    async def on_select(interaction: discord.Interaction):
+        chosen = interaction.data["values"][0]
+        if chosen not in sections:
+            await interaction.response.send_message("Unknown section.", ephemeral=True)
+            return
+        title, body = sections[chosen]
+        embed = discord.Embed(title=title, description=body, color=0x9B59B6)
+        if admin:
+            embed.set_footer(text="🔒 Admin Reference  •  &help to reopen")
+        else:
+            embed.set_footer(text="💜 AutoBuy  •  &help to reopen this guide")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    select.callback = on_select
+    view = discord.ui.View(timeout=120)
+    view.add_item(select)
+
+    if admin:
+        intro = discord.Embed(
+            title="🛡️  Admin Command Reference",
+            description=(
+                "Select a category from the dropdown below to view its commands.\n"
+                "All responses are **private** — only you can see them."
+            ),
+            color=0x9B59B6,
+        )
+        intro.set_footer(text="🔒 Admin-only  •  Dropdown expires after 2 minutes")
+    else:
+        intro = discord.Embed(
+            title="🛍️  AutoBuy Help Centre",
+            description=(
+                "Select a topic from the dropdown below to get started.\n"
+                "All responses are **private** — only you can see them."
+            ),
+            color=0x9B59B6,
+        )
+        intro.set_footer(text="💜 AutoBuy  •  Dropdown expires after 2 minutes")
+
+    await ctx.reply(embed=intro, view=view)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  &clearhistory — wipe orders, feedback, blacklist
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.command(name="clearhistory")
+async def cmd_clearhistory(ctx: commands.Context):
+    """Admin: Permanently delete all order history and blacklist entries."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+
+    order_count = await col_orders.count_documents({})
+    bl_count    = await col_blacklist.count_documents({})
+
+    await ctx.reply(embed=discord.Embed(
+        title="⚠️  Confirm Full History Wipe",
+        description=(
+            f"This will permanently delete:\n\n"
+            f"🗂️ **{order_count}** orders\n"
+            f"🚫 **{bl_count}** blacklist entries\n\n"
+            "Categories, stock, settings and ToC are **not affected**.\n\n"
+            "Type `confirm` or `cancel`."
+        ),
+        color=0xE74C3C,
+    ))
+
+    def chk1(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("confirm", "cancel")
+    try:
+        r1 = await bot.wait_for("message", check=chk1, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.reply("⏰ Timed out.")
+        return
+    if r1.content.lower() == "cancel":
+        await ctx.reply("✅ Cancelled.")
+        return
+
+    await ctx.reply(embed=discord.Embed(
+        title="⚠️  Final Confirmation",
+        description="Type `DELETE` (all caps) to confirm. This cannot be undone.",
+        color=0xE74C3C,
+    ))
+    def chk2(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+    try:
+        r2 = await bot.wait_for("message", check=chk2, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.reply("⏰ Timed out.")
+        return
+    if r2.content.strip() != "DELETE":
+        await ctx.reply("✅ Cancelled.")
+        return
+
+    await col_orders.delete_many({})
+    await col_blacklist.delete_many({})
+
+    await send_log(discord.Embed(
+        title="🗑️  Full History Wiped",
+        description=f"**By:** {ctx.author.mention} — {order_count} orders, {bl_count} blacklist",
+        color=0xE74C3C,
+    ))
+    await ctx.reply(embed=discord.Embed(
+        title="✅  History Cleared",
+        description=(
+            f"🗂️ **{order_count}** orders deleted\n"
+            f"🚫 **{bl_count}** blacklist entries deleted\n\n"
+            "Categories, stock, settings and ToC are untouched."
+        ),
+        color=0x7B2FBE,
+    ))
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  &setminqty <category> <minimum>
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.command(name="setminqty")
+async def cmd_setminqty(ctx: commands.Context, category: str, minimum: int):
+    """Admin: Set the minimum purchase quantity for a product.
+    Usage: &setminqty netflix-1-month 3"""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    if minimum < 1:
+        await ctx.reply(embed=discord.Embed(
+            title="⚠️  Invalid Value",
+            description="Minimum quantity must be **1** or greater.",
+            color=0xE74C3C,
+        ))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(embed=discord.Embed(
+            title="❌  Product Not Found",
+            description=f"No product matched `{category}`.\nUse `&stock` to see all available products.",
+            color=0xE74C3C,
+        ))
+        return
+    old = int(cat.get("min_quantity") or 1)
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"min_quantity": minimum}})
+    await send_log(discord.Embed(
+        title="📦  Minimum Quantity Updated",
+        description=f"**Product:** {cat['name']}\n**Changed:** {old} → {minimum}\n**By:** {ctx.author.mention}",
+        color=0x9B59B6,
+    ))
+    embed = discord.Embed(
+        title="✅  Minimum Quantity Updated",
+        description=f"Buyers must now order at least **{minimum}** unit(s) of **{cat['name']}**.",
+        color=0x7B2FBE,
+    )
+    embed.add_field(name="📦  Product",      value=cat["name"],  inline=True)
+    embed.add_field(name="📉  Previous Min", value=str(old),     inline=True)
+    embed.add_field(name="📈  New Min",      value=str(minimum), inline=True)
+    embed.set_footer(text="Changes take effect immediately for all new orders.")
+    await ctx.reply(embed=embed)
+    asyncio.create_task(auto_update_panel())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  &setinstruction <category> <text|clear>
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.command(name="setinstruction")
+async def cmd_setinstruction(ctx: commands.Context, category: str, *, instruction: str):
+    """Admin: Edit the delivery instructions for a category.
+    Usage:  &setinstruction netflix Login at netflix.com with the credentials below.
+            &setinstruction netflix clear    ← removes instructions"""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    cat = await db_find_category(category)
+    if not cat:
+        await ctx.reply(embed=discord.Embed(
+            title="❌  Product Not Found",
+            description=f"No product matched `{category}`.\nUse `&stock` to see all available products.",
+            color=0xE74C3C,
+        ))
+        return
+    if instruction.strip().lower() == "clear":
+        await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"instruction": ""}})
+        await send_log(discord.Embed(
+            title="📌  Delivery Instructions Cleared",
+            description=f"**Product:** {cat['name']}\n**By:** {ctx.author.mention}",
+            color=0xA855F7,
+        ))
+        await ctx.reply(embed=discord.Embed(
+            title="✅  Instructions Cleared",
+            description=f"Delivery instructions for **{cat['name']}** have been removed.",
+            color=0x7B2FBE,
+        ))
+        return
+    if len(instruction) > 1024:
+        await ctx.reply(embed=discord.Embed(
+            title="⚠️  Text Too Long",
+            description="Instruction text exceeds the **1,024 character** limit. Please shorten and try again.",
+            color=0xE74C3C,
+        ))
+        return
+    old = cat.get("instruction") or "*(none)*"
+    await col_cats.update_one({"slug": cat["slug"]}, {"$set": {"instruction": instruction}})
+    embed = discord.Embed(
+        title="✅  Delivery Instructions Updated",
+        description=f"Buyers will see this message after their items are delivered for **{cat['name']}**.",
+        color=0x7B2FBE,
+    )
+    embed.add_field(name="📦  Product",          value=cat["name"],                                      inline=False)
+    embed.add_field(name="🗑️  Previous",         value=(old[:200] if old != "*(none)*" else "*(none)*"), inline=False)
+    embed.add_field(name="📝  New Instructions", value=instruction[:200],                                 inline=False)
+    embed.set_footer(text="This message is shown to the buyer upon delivery  •  &setinstruction <name> clear to remove")
+    await ctx.reply(embed=embed)
+    await send_log(discord.Embed(
+        title="📌  Delivery Instructions Updated",
+        description=f"**Product:** {cat['name']}\n**By:** {ctx.author.mention}\n\n{instruction[:400]}",
+        color=0x9B59B6,
+    ))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  &orderitems <order_id>  — view delivered items for an order
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.command(name="orderitems")
+async def cmd_orderitems(ctx: commands.Context, order_id: str):
+    """Admin: View the exact items that were delivered for an order.
+    Usage: &orderitems ORD-1234567890-ABCDEF"""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(title="🔒  Access Denied", description="This command is restricted to administrators.", color=0xE74C3C))
+        return
+    order = await db_get_order(order_id)
+    if not order:
+        await ctx.reply(embed=discord.Embed(
+            title="❌  Order Not Found",
+            description=f"No order was found with ID `{order_id}`.\nPlease verify the ID and try again.",
+            color=0xE74C3C,
+        ))
+        return
+
+    delivered_items = order.get("deliveredItems", [])
+    status_icons = {
+        "pending":                "🟡",
+        "awaiting_confirmation":  "🔵",
+        "delivered":              "🟢",
+        "cancelled":              "🔴",
+        "expired":                "⚫",
+        "error":                  "🟠",
+        "refunded":               "🟠",
+    }
+    status_label = f"{status_icons.get(order['status'], '⚪')}  {order['status'].replace('_', ' ').title()}"
+
+    embed = discord.Embed(
+        title=f"📦  Delivered Items — Order Lookup",
+        description=f"Showing delivery record for order `{order_id}`",
+        color=0x9B59B6,
+    )
+    embed.add_field(name="👤  Buyer",       value=f"<@{order['userId']}>",          inline=True)
+    embed.add_field(name="🛍️  Product",    value=order["categoryName"],              inline=True)
+    embed.add_field(name="📊  Status",      value=status_label,                      inline=True)
+    embed.add_field(name="🔢  Quantity",    value=str(order["quantity"]),            inline=True)
+    embed.add_field(name="💰  Order Total", value=f"${order['totalUSD']:.2f} USD",  inline=True)
+    embed.add_field(name="🕐  Paid At",     value=(order.get("paidAt") or "N/A")[:19], inline=True)
+
+    if not delivered_items:
+        embed.add_field(
+            name="📋  Items Delivered",
+            value="*No delivery record found. The order may not have been fulfilled yet.*",
+            inline=False,
+        )
+    elif len(delivered_items) <= 10:
+        embed.add_field(
+            name=f"📋  Items Delivered ({len(delivered_items)})",
+            value="\n".join(f"`{item}`" for item in delivered_items)[:1024],
+            inline=False,
+        )
+    else:
+        import io as _io
+        file_bytes = "\n".join(delivered_items).encode("utf-8")
+        f = discord.File(fp=_io.BytesIO(file_bytes), filename=f"delivered-{order_id}.txt")
+        embed.add_field(
+            name=f"📋  Items Delivered ({len(delivered_items)})",
+            value="Too many items to display inline — see the attached file.",
+            inline=False,
+        )
+        embed.set_footer(text=f"Order ID: {order_id}")
+        await ctx.reply(embed=embed, file=f)
+        return
+
+    embed.set_footer(text=f"Order ID: {order_id}")
+    await ctx.reply(embed=embed)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RUN
+# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EMOJI SETUP — bulk-upload all custom emojis used in bot embeds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Master list of every custom emoji the bot uses in its embeds.
+# Add new entries here whenever a new embed emoji is needed.
+# Format: { "name": "discord_emoji_name", "url": "image_url" }
+BOT_EMBED_EMOJIS: list[dict] = [
+    # ── Info / UI ──────────────────────────────────────────────────────────────
+    {
+        "name": "bot_info",
+        "url":  "https://i.ibb.co/C3n6RWX5/1000272252-removebg-preview.png",
+    },
+    # ── Status indicators ──────────────────────────────────────────────────────
+    {
+        "name": "bot_online",
+        "url":  "https://cdn.discordapp.com/emojis/852541394145427456.png",   # green circle
+    },
+    # ── Payments ──────────────────────────────────────────────────────────────
+    {
+        "name": "bot_ltc",
+        "url":  "https://cryptologos.cc/logos/litecoin-ltc-logo.png",
+    },
+    # ── Shopping cart ─────────────────────────────────────────────────────────
+    {
+        "name": "bot_cart",
+        "url":  "https://cdn-icons-png.flaticon.com/512/3144/3144456.png",
+    },
+    # ── Payment status cards ─────────────────────────────────────────────────
+    {
+        "name": "bot_loading",
+        "url":  LOADING_IMAGE_URL,
+    },
+    {
+        "name": "bot_confirmed",
+        "url":  CONFIRMED_IMAGE_URL,
+    },
+    # ── Order Finalized card ──────────────────────────────────────────────────
+    {
+        "name": "bot_noentry",
+        "url":  "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f6ab.png",
+    },
+    {
+        "name": "bot_pin",
+        "url":  "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f4cc.png",
+    },
+    {
+        "name": "bot_assistance",
+        "url":  "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f9d1-200d-1f4bc.png",
+    },
+    {
+        "name": "bot_sweep",
+        "url":  "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f9f9.png",
+    },
+    {
+        "name": "bot_lock",
+        "url":  "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f512.png",
+    },
+]
+
+
+EMOJI_PROMPT_TIMEOUT = 60  # seconds to wait for admin's manual image per emoji
+
+
+async def _resolve_emoji_image_bytes(session: aiohttp.ClientSession, url: str) -> bytes | None:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.read()
+    except Exception:
+        return None
+
+
+@bot.command(name="setupemojis")
+async def cmd_setupemojis(ctx: commands.Context):
+    """Admin: Set up bot embed emojis one by one.
+    Usage: &setupemojis
+    For each emoji, reply in this channel with an image attachment, an image URL,
+    or an existing emoji (e.g. one already added to this server) within 60 seconds.
+    Type `skip` (or just wait out the timeout) to use the default image instead.
+    Safe to run multiple times — already-existing emojis are skipped."""
+    if not is_admin(ctx):
+        await ctx.reply(embed=discord.Embed(
+            title="🔒  Access Denied",
+            description="This command is restricted to administrators.",
+            color=0xE74C3C,
+        ))
+        return
+
+    if not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.")
+        return
+
+    guild = ctx.guild
+    existing_names = {e.name for e in guild.emojis}
+    results: list[str] = []
+
+    intro_embed = discord.Embed(
+        title="Emoji Setup",
+        description=(
+            f"Setting up **{len(BOT_EMBED_EMOJIS)}** emoji(s), one at a time.\n"
+            "For each one, send an **image attachment, image URL, or an existing emoji** "
+            f"in this channel within **{EMOJI_PROMPT_TIMEOUT}s**, or type `skip` to use the default image."
+        ),
+        color=0x1A1A2E,
+    )
+    intro_embed.set_author(name="Emoji Setup", icon_url=INFO_IMAGE_URL)
+    intro_embed.set_thumbnail(url=INFO_IMAGE_URL)
+    await ctx.reply(embed=intro_embed)
+
+    def check(m: discord.Message):
+        return m.channel.id == ctx.channel.id and m.author.id == ctx.author.id
+
+    async with aiohttp.ClientSession() as session:
+        for entry in BOT_EMBED_EMOJIS:
+            name        = entry["name"]
+            default_url = entry["url"]
+
+            if name in existing_names:
+                results.append(f"⏭️  `:{name}:` — already exists, skipped")
+                continue
+
+            ask_embed = discord.Embed(
+                title=f"Emoji: {name}",
+                description=(
+                    f"Send an image (attachment or URL), or an existing emoji, for `:{name}:` now, "
+                    f"or type `skip` to use the default.\n**{EMOJI_PROMPT_TIMEOUT}s to respond.**"
+                ),
+                color=0x1A1A2E,
+            )
+            ask_embed.set_author(name="Emoji Setup", icon_url=INFO_IMAGE_URL)
+            ask_embed.set_thumbnail(url=default_url)
+            await ctx.send(embed=ask_embed)
+
+            source_url  = default_url
+            used_custom = False
+            try:
+                msg = await bot.wait_for("message", check=check, timeout=EMOJI_PROMPT_TIMEOUT)
+                raw = msg.content.strip()
+                emoji_match = re.fullmatch(r"<(a?):(\w+):(\d+)>", raw)
+                if msg.attachments:
+                    # Attachment sent — grab its file and use it as the emoji image
+                    source_url  = msg.attachments[0].url
+                    used_custom = True
+                elif emoji_match:
+                    # An existing emoji (already added to the server, or any custom emoji
+                    # the user has access to) was sent directly — reuse its image.
+                    animated   = emoji_match.group(1) == "a"
+                    emoji_id   = emoji_match.group(3)
+                    ext        = "gif" if animated else "png"
+                    source_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+                    used_custom = True
+                elif raw.lower() != "skip" and raw.startswith(("http://", "https://")):
+                    source_url  = raw
+                    used_custom = True
+                # anything else (e.g. "skip" or gibberish) falls back to default_url
+            except asyncio.TimeoutError:
+                pass  # no response — use default
+
+            image_bytes = await _resolve_emoji_image_bytes(session, source_url)
+            if image_bytes is None and used_custom:
+                # custom image failed to fetch — fall back to default
+                image_bytes = await _resolve_emoji_image_bytes(session, default_url)
+                used_custom = False
+
+            if image_bytes is None:
+                results.append(f"❌  `:{name}:` — could not fetch image (custom or default)")
+                continue
+
+            try:
+                emoji = await guild.create_custom_emoji(name=name, image=image_bytes)
+                tag   = "custom image" if used_custom else "default image"
+                results.append(f"✅  `:{name}:` — uploaded as {emoji} ({tag})")
+                existing_names.add(name)
+            except discord.Forbidden:
+                results.append(f"❌  `:{name}:` — bot lacks Manage Emojis permission")
+            except discord.HTTPException as e:
+                results.append(f"❌  `:{name}:` — Discord error: {e}")
+            except Exception as e:
+                results.append(f"❌  `:{name}:` — {e}")
+
+    done_embed = discord.Embed(
+        title="Emoji Setup Complete",
+        description="\n".join(results) or "No emojis to process.",
+        color=0x1A1A2E,
+    )
+    done_embed.set_author(name="Emoji Setup", icon_url=INFO_IMAGE_URL)
+    done_embed.set_thumbnail(url=INFO_IMAGE_URL)
+    done_embed.set_footer(text="Run &setupemojis again anytime to fill in remaining or new emojis.")
+    await ctx.send(embed=done_embed)
+
+
+bot.run(DISCORD_TOKEN)
